@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::catalog::Catalog;
 use crate::capabilities::{CapabilityOverrides, ResolvedCapabilities};
 use crate::dialect;
-use crate::error::{ApiError, Error, TransportError};
+use crate::error::{ApiError, ConfigError, Error, TransportError};
 use crate::gate::{self, ChatRequest};
 use crate::message::Message;
 use crate::options::Options;
@@ -40,6 +40,25 @@ fn default_catalog() -> &'static Catalog {
     CATALOG.get_or_init(Catalog::builtin)
 }
 
+/// How the api key travels. `Bearer` is the OpenAI-compatible default;
+/// `Header` sends the credential under a provider-specific header (MiMo
+/// uses `api-key:`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
+    Bearer,
+    Header { name: String, value: String },
+}
+
+fn provider_default_auth(provider: Provider, api_key: &str) -> Auth {
+    match provider {
+        Provider::MiMo => Auth::Header {
+            name: "api-key".into(),
+            value: api_key.to_string(),
+        },
+        _ => Auth::Bearer,
+    }
+}
+
 /// One provider, one Model Id, one credential. Construct it, then Chat.
 pub struct Client {
     provider: Provider,
@@ -48,6 +67,7 @@ pub struct Client {
     base_url: Option<String>,
     options: Options,
     overrides: CapabilityOverrides,
+    auth: Auth,
     retry: RetryPolicy,
     timeout: Duration,
     stream_first_token_timeout: Duration,
@@ -57,13 +77,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(provider: Provider, model: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into();
         Client {
             provider,
             model: model.into(),
-            api_key: api_key.into(),
+            api_key,
             base_url: None,
             options: Options::default(),
             overrides: CapabilityOverrides::default(),
+            auth: Auth::Bearer,
             retry: RetryPolicy::default(),
             timeout: DEFAULT_CHAT_TIMEOUT,
             stream_first_token_timeout: DEFAULT_FIRST_TOKEN_TIMEOUT,
@@ -72,10 +94,38 @@ impl Client {
                 .build()
                 .expect("reqwest client with rustls should always build"),
         }
+        .with_default_auth()
+    }
+
+    fn with_default_auth(mut self) -> Self {
+        self.auth = provider_default_auth(self.provider, &self.api_key);
+        self
+    }
+
+    /// Builds the Client with the provider's api key read from its
+    /// conventional environment variable (see `Provider::env_key_name`).
+    /// Fails with a `Config` error when the variable is unset or empty.
+    pub fn from_env(provider: Provider, model: impl Into<String>) -> Result<Self, Error> {
+        let name = provider.env_key_name();
+        match std::env::var(name) {
+            Ok(key) if !key.is_empty() => Ok(Self::new(provider, model, key)),
+            _ => Err(Error::Config(ConfigError {
+                message: format!(
+                    "{name} is not set; it is the conventional environment variable for {provider}"
+                ),
+            })),
+        }
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
+        self
+    }
+
+    /// Overrides how the api key travels (default: Bearer). For `Auth::Header`
+    /// the value is sent verbatim, so embed the key yourself when overriding.
+    pub fn with_auth(mut self, auth: Auth) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -156,12 +206,8 @@ impl Client {
 
         let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
         let url = self.url();
-        let response = self
-            .http
-            .post(&url)
-            .timeout(self.timeout)
-            .bearer_auth(&self.api_key)
-            .json(&body)
+        let request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
+        let response = request
             .send()
             .await
             .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
@@ -201,6 +247,13 @@ impl Client {
             .clone()
             .unwrap_or_else(|| self.provider.default_base_url().to_string());
         format!("{}/chat/completions", base.trim_end_matches('/'))
+    }
+
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Auth::Bearer => request.bearer_auth(&self.api_key),
+            Auth::Header { name, value } => request.header(name, value),
+        }
     }
 
     async fn send(&self, body: &serde_json::Value) -> Result<Reply, Error> {
@@ -248,12 +301,8 @@ impl Client {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<Reply, (Error, Option<Duration>)> {
-        let response = self
-            .http
-            .post(url)
-            .timeout(self.timeout)
-            .bearer_auth(&self.api_key)
-            .json(body)
+        let request = self.apply_auth(self.http.post(url).timeout(self.timeout).json(body));
+        let response = request
             .send()
             .await
             .map_err(|e| {
@@ -699,5 +748,89 @@ mod tests {
         let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
         let _ = stream.next().await;
         drop(stream); // cancels the request; must not block or panic
+    }
+
+    #[tokio::test]
+    async fn moonshot_uses_bearer_auth_and_v1_path() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer sk-kimi")
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::Moonshot, "kimi-k3", "sk-kimi")
+            .with_base_url(server.url());
+        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn openrouter_passes_composite_ids_through() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer sk-or")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "model": "deepseek/deepseek-v4-pro"
+            })))
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::OpenRouter, "deepseek/deepseek-v4-pro", "sk-or")
+            .with_base_url(server.url());
+        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn mimo_authenticates_with_api_key_header() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("api-key", "sk-mimo")
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo")
+            .with_base_url(server.url());
+        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn mimo_streaming_uses_the_same_auth() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .match_header("api-key", "sk-mimo")
+            .with_body(sse_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo")
+            .with_base_url(server.url());
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let chunk = stream.next().await.expect("first chunk").expect("chunk ok");
+        assert!(chunk.delta.is_some());
+    }
+
+    #[test]
+    fn env_key_fallback_per_provider() {
+        let name = Provider::OpenRouter.env_key_name();
+        assert_eq!(name, "OPENROUTER_API_KEY");
+        // SAFETY: tests run in one process per binary; rustc test harness runs
+        // tests on multiple threads, so a name collision would race — these
+        // names are unique per test below.
+        unsafe { std::env::set_var(name, "sk-env") };
+        let client = Client::from_env(Provider::OpenRouter, "deepseek/deepseek-v4-pro").expect("env key must be found");
+        assert_eq!(client.api_key, "sk-env");
+
+        unsafe { std::env::remove_var(name) };
+        let err = match Client::from_env(Provider::OpenRouter, "deepseek/deepseek-v4-pro") {
+            Ok(_) => panic!("missing env key must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("OPENROUTER_API_KEY"));
     }
 }

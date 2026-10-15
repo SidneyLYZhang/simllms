@@ -19,7 +19,7 @@ pub mod stream;
 
 pub use capabilities::{Capabilities, CapabilityOverrides, Modality, ModelStatus, ReasoningMode, ResolvedCapabilities, Source};
 pub use catalog::Catalog;
-pub use client::{Client, RetryPolicy};
+pub use client::{Auth, Client, RetryPolicy};
 pub use error::{ApiError, CapabilityError, ConfigError, Error, MissingCapability, TransportError};
 pub use gate::{gate, ChatRequest, GateOutcome, Warning};
 pub use message::{ContentBlock, ImageSource, Message, Role};
