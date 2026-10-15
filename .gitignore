@@ -9,3 +9,6 @@ dist/
 
 # generated docs navigation copy of the root changelog
 /docs/changelog.md
+
+# LLM
+agents/
