@@ -1,0 +1,22 @@
+[package]
+name = "simllms-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Deliberately outside the parent workspace (ADR-0001): the pure-Rust core
+# must never link PyO3, and this crate keeps its own lockfile.
+[workspace]
+
+[lib]
+name = "simllms_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.22"
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py310"] }
+serde_json = "1"
+simllms = { path = "../simllms" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

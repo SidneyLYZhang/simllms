@@ -1,0 +1,420 @@
+//! Python bindings for simllms: `simllms._core`.
+//!
+//! One pyclass (`Client`) mirroring the Rust builder surface as constructor
+//! kwargs, one exception per Rust error layer, and a per-call tokio runtime
+//! kept off the GIL. Async lives in the pure-Python layer (ADR-0003).
+
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use pyo3::create_exception;
+use pyo3::exceptions::{PyException, PyTypeError};
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyDict, PyList};
+
+use simllms::capabilities::CapabilityOverrides;
+use simllms::error::{Error, MissingCapability};
+use simllms::message::{ContentBlock, ImageSource, Message, Role};
+use simllms::options::Options;
+use simllms::provider::Provider;
+use simllms::reply::Reply;
+
+create_exception!(
+    simllms,
+    SimLLMError,
+    PyException,
+    "Base class for every simllms error."
+);
+create_exception!(
+    simllms,
+    CapabilityError,
+    SimLLMError,
+    "The Gate refused this request before any network call. Attributes: model, missing, suggestions."
+);
+create_exception!(
+    simllms,
+    ConfigError,
+    SimLLMError,
+    "Invalid client configuration (bad base_url, unsupported parameter, ...)."
+);
+create_exception!(
+    simllms,
+    APIError,
+    SimLLMError,
+    "The provider returned an error. Attributes: status, provider_message, raw_body — raw_body is the provider's answer untouched, take it to their support."
+);
+create_exception!(
+    simllms,
+    TransportError,
+    SimLLMError,
+    "The request never completed (connection failed, timeout). Retryable."
+);
+
+fn missing_name(missing: &MissingCapability) -> String {
+    match missing {
+        MissingCapability::ImageInput => "ImageInput".into(),
+        MissingCapability::StructuredOutput => "StructuredOutput".into(),
+        MissingCapability::Reasoning => "Reasoning".into(),
+        MissingCapability::ReasoningEffort(effort) => format!("ReasoningEffort({effort})"),
+        MissingCapability::ImageGeneration => "ImageGeneration".into(),
+        MissingCapability::ToolCall => "ToolCall".into(),
+        _ => "Unknown".into(),
+    }
+}
+
+fn parse_provider(name: &str) -> PyResult<Provider> {
+    match name {
+        "deepseek" => Ok(Provider::DeepSeek),
+        "moonshot" => Ok(Provider::Moonshot),
+        "dashscope" => Ok(Provider::DashScope),
+        "zhipu" => Ok(Provider::Zhipu),
+        "mimo" => Ok(Provider::MiMo),
+        "openrouter" => Ok(Provider::OpenRouter),
+        "custom" => Ok(Provider::Custom),
+        other => Err(PyTypeError::new_err(format!(
+            "unknown provider `{other}`; expected deepseek, moonshot, dashscope, zhipu, mimo, openrouter, or custom"
+        ))),
+    }
+}
+
+fn map_error(err: Error) -> PyErr {
+    Python::attach(|py| {
+        let py_err = match &err {
+            Error::Capability(e) => {
+                let pe = CapabilityError::new_err(e.to_string());
+                let v = pe.value(py);
+                let _ = v.setattr("model", e.model.clone());
+                let _ = v.setattr("missing", missing_name(&e.missing));
+                let _ = v.setattr("suggestions", e.suggestions.clone());
+                pe
+            }
+            Error::Config(e) => ConfigError::new_err(e.message.clone()),
+            Error::Api(e) => {
+                let pe = APIError::new_err(e.to_string());
+                let v = pe.value(py);
+                let _ = v.setattr("status", e.status);
+                let _ = v.setattr("provider_message", e.provider_message.clone());
+                let _ = v.setattr("raw_body", e.raw_body.clone());
+                pe
+            }
+            Error::Transport(e) => TransportError::new_err(e.message.clone()),
+            _ => SimLLMError::new_err(err.to_string()),
+        };
+        py_err
+    })
+}
+
+fn pyany_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if value.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    // bool before int: bool is a subclass of int on the wire.
+    if let Ok(b) = value.extract::<bool>() {
+        return Ok(serde_json::Value::Bool(b));
+    }
+    if let Ok(i) = value.extract::<i64>() {
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        return serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| PyTypeError::new_err("cannot convert non-finite float to JSON"));
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(serde_json::Value::String(s));
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        let items: PyResult<Vec<serde_json::Value>> =
+            list.iter().map(|v| pyany_to_json(&v)).collect();
+        return Ok(serde_json::Value::Array(items?));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            map.insert(key, pyany_to_json(&v)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    Err(PyTypeError::new_err(format!(
+        "cannot convert {} to JSON",
+        value.get_type().name()?
+    )))
+}
+
+fn parse_options(dict: &Bound<'_, PyDict>) -> PyResult<Options> {
+    let mut options = Options::default();
+    for (k, v) in dict.iter() {
+        let key: String = k.extract()?;
+        match key.as_str() {
+            "temperature" => options.temperature = v.extract()?,
+            "top_p" => options.top_p = v.extract()?,
+            "top_k" => options.top_k = v.extract()?,
+            "max_tokens" => options.max_tokens = v.extract()?,
+            "stop" => options.stop = Some(v.extract()?),
+            "seed" => options.seed = v.extract()?,
+            "presence_penalty" => options.presence_penalty = v.extract()?,
+            "frequency_penalty" => options.frequency_penalty = v.extract()?,
+            "reasoning_enabled" => options.reasoning_enabled = v.extract()?,
+            "reasoning_effort" => {
+                options.reasoning_effort =
+                    Some(simllms::options::ReasoningEffort(v.extract::<String>()?))
+            }
+            "response_schema" => options.response_schema = Some(pyany_to_json(&v)?),
+            "extra" => {
+                let extra = v
+                    .cast::<PyDict>()
+                    .map_err(|_| PyTypeError::new_err("`extra` must be a dict"))?;
+                for (ek, ev) in extra.iter() {
+                    let ekey: String = ek.extract()?;
+                    options.extra.insert(ekey, pyany_to_json(&ev)?);
+                }
+            }
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unknown option `{other}`; provider-specific extras go under `extra`"
+                )))
+            }
+        }
+    }
+    Ok(options)
+}
+
+fn parse_overrides(dict: &Bound<'_, PyDict>) -> PyResult<CapabilityOverrides> {
+    let mut overrides = CapabilityOverrides::default();
+    for (k, v) in dict.iter() {
+        let key: String = k.extract()?;
+        match key.as_str() {
+            "image_input" => overrides.image_input = v.extract()?,
+            "structured_output" => overrides.structured_output = v.extract()?,
+            "tool_call" => overrides.tool_call = v.extract()?,
+            "image_generation" => overrides.image_generation = v.extract()?,
+            "context_window" => overrides.context_window = v.extract()?,
+            "max_output_tokens" => overrides.max_output_tokens = v.extract()?,
+            "reasoning" => {
+                let mode: String = v.extract()?;
+                overrides.reasoning = Some(match mode.as_str() {
+                    "none" => simllms::capabilities::ReasoningMode::None,
+                    "toggle" => simllms::capabilities::ReasoningMode::Toggle,
+                    other => {
+                        let levels: Vec<String> = other
+                            .split('+')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if levels.is_empty() {
+                            return Err(PyTypeError::new_err(
+                                "reasoning override must be \"none\", \"toggle\", or effort levels joined by `+` (e.g. \"low+high\")",
+                            ));
+                        }
+                        simllms::capabilities::ReasoningMode::Effort {
+                            levels: levels.into_iter().collect(),
+                        }
+                    }
+                });
+            }
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unknown capability override `{other}`"
+                )))
+            }
+        }
+    }
+    Ok(overrides)
+}
+
+fn parse_role(role: &str) -> PyResult<Role> {
+    match role {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        other => Err(PyTypeError::new_err(format!(
+            "unknown role `{other}`; expected system, user, or assistant"
+        ))),
+    }
+}
+
+fn parse_block(dict: &Bound<'_, PyDict>) -> PyResult<ContentBlock> {
+    let kind: String = dict
+        .get_item("type")?
+        .ok_or_else(|| PyTypeError::new_err("content block needs a `type`"))?
+        .extract()?;
+    match kind.as_str() {
+        "text" => {
+            let text: String = dict
+                .get_item("text")?
+                .ok_or_else(|| PyTypeError::new_err("text block needs `text`"))?
+                .extract()?;
+            Ok(ContentBlock::Text(text))
+        }
+        "image_url" => {
+            let url: String = dict
+                .get_item("url")?
+                .ok_or_else(|| PyTypeError::new_err("image_url block needs `url`"))?
+                .extract()?;
+            Ok(ContentBlock::Image(ImageSource::Url(url)))
+        }
+        "image_base64" => {
+            let data: String = dict
+                .get_item("data")?
+                .ok_or_else(|| PyTypeError::new_err("image_base64 block needs `data`"))?
+                .extract()?;
+            let mime_type: String = dict
+                .get_item("mime_type")?
+                .ok_or_else(|| PyTypeError::new_err("image_base64 block needs `mime_type`"))?
+                .extract()?;
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| PyTypeError::new_err(format!("image_base64 `data` is not valid base64: {e}")))?;
+            Ok(ContentBlock::Image(ImageSource::Base64 {
+                data: bytes,
+                mime_type,
+            }))
+        }
+        other => Err(PyTypeError::new_err(format!(
+            "unknown content block type `{other}`; expected text, image_url, or image_base64"
+        ))),
+    }
+}
+
+fn parse_messages(list: &Bound<'_, PyList>) -> PyResult<Vec<Message>> {
+    let mut messages = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        if let Ok(text) = item.extract::<String>() {
+            messages.push(Message::text(text));
+            continue;
+        }
+        let dict = item
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each message must be a str or a dict"))?;
+        let role: String = dict
+            .get_item("role")?
+            .ok_or_else(|| PyTypeError::new_err("message dict needs `role`"))?
+            .extract()?;
+        let role = parse_role(&role)?;
+        let content_value = dict
+            .get_item("content")?
+            .ok_or_else(|| PyTypeError::new_err("message dict needs `content`"))?;
+        let content = if let Ok(text) = content_value.extract::<String>() {
+            vec![ContentBlock::Text(text)]
+        } else if let Ok(blocks) = content_value.cast::<PyList>() {
+            blocks.iter().map(|b| parse_block(b.cast::<PyDict>().map_err(|_| PyTypeError::new_err("content blocks must be dicts"))?)).collect::<PyResult<Vec<_>>>()?
+        } else {
+            return Err(PyTypeError::new_err(
+                "message `content` must be a str or a list of blocks",
+            ));
+        };
+        messages.push(Message::blocks(role, content));
+    }
+    Ok(messages)
+}
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for simllms")
+    })
+}
+
+/// `Reply` as Python sees it: the content plus the usage the provider
+/// reported (None when the provider sent none).
+#[pyclass]
+struct PyReply {
+    #[pyo3(get)]
+    content: String,
+    #[pyo3(get)]
+    prompt_tokens: Option<u64>,
+    #[pyo3(get)]
+    completion_tokens: Option<u64>,
+    #[pyo3(get)]
+    total_tokens: Option<u64>,
+}
+
+impl From<Reply> for PyReply {
+    fn from(reply: Reply) -> Self {
+        let usage = reply.usage;
+        PyReply {
+            content: reply.content,
+            prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
+            completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
+            total_tokens: usage.and_then(|u| u.total_tokens),
+        }
+    }
+}
+
+#[pyclass]
+struct Client {
+    inner: Arc<simllms::Client>,
+}
+
+#[pymethods]
+impl Client {
+    #[new]
+    #[pyo3(signature = (provider, model, api_key=None, *, base_url=None, options=None, capability_overrides=None, timeout=None))]
+    fn new(
+        provider: &str,
+        model: &str,
+        api_key: Option<String>,
+        base_url: Option<String>,
+        options: Option<&Bound<'_, PyDict>>,
+        capability_overrides: Option<&Bound<'_, PyDict>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Self> {
+        let provider = parse_provider(provider)?;
+        let mut client = match api_key {
+            Some(key) => simllms::Client::new(provider, model, key),
+            None => simllms::Client::from_env(provider, model).map_err(map_error)?,
+        };
+        if let Some(url) = base_url {
+            client = client.with_base_url(url);
+        }
+        if let Some(dict) = options {
+            client = client.with_options(parse_options(dict)?);
+        }
+        if let Some(dict) = capability_overrides {
+            client = client.with_capability_overrides(parse_overrides(dict)?);
+        }
+        if let Some(seconds) = timeout {
+            client = client.with_timeout(Duration::from_secs_f64(seconds));
+        }
+        Ok(Client { inner: Arc::new(client) })
+    }
+
+    /// Chat once. `messages` is a list of str (treated as user messages) or
+    /// dicts `{"role": ..., "content": ...}`. Returns a Reply.
+    #[pyo3(signature = (messages, options=None))]
+    fn chat(&self, py: Python<'_>, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<PyReply> {
+        let messages = parse_messages(messages)?;
+        let options = match options {
+            Some(dict) => parse_options(dict)?,
+            None => Options::default(),
+        };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            runtime()
+                .block_on(async move { inner.chat_with(messages, options).await })
+                .map(PyReply::from)
+                .map_err(map_error)
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        "simllms.Client(...)".to_string()
+    }
+}
+
+#[pymodule(name = "_core")]
+fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("SimLLMError", m.py().get_type::<SimLLMError>())?;
+    m.add("CapabilityError", m.py().get_type::<CapabilityError>())?;
+    m.add("ConfigError", m.py().get_type::<ConfigError>())?;
+    m.add("APIError", m.py().get_type::<APIError>())?;
+    m.add("TransportError", m.py().get_type::<TransportError>())?;
+    m.add_class::<Client>()?;
+    m.add("Reply", m.py().get_type::<PyReply>())?;
+    Ok(())
+}
