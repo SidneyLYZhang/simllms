@@ -23,6 +23,23 @@ impl Catalog {
         self.entries.insert((provider, model.into()), caps);
     }
 
+    /// Ids of this provider's models satisfying a Capability predicate,
+    /// sorted — used to make a refusal actionable ("use one of these").
+    pub fn models_with(
+        &self,
+        provider: Provider,
+        pred: impl Fn(&Capabilities) -> bool,
+    ) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|((p, _), caps)| *p == provider && pred(caps))
+            .map(|((_, id), _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn snapshot_commit(&self) -> &'static str {
         catalog_data::SNAPSHOT_COMMIT
     }

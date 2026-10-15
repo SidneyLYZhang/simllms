@@ -71,18 +71,21 @@ fn check(caps: &Capabilities, request: &ChatRequest, model: &str) -> Result<(), 
     if request.has_image_input() && !caps.accepts_image_input() {
         return Err(Error::Capability(CapabilityError {
             model: model_id,
+            suggestions: Vec::new(),
             missing: MissingCapability::ImageInput,
         }));
     }
     if request.options.response_schema.is_some() && !caps.structured_output {
         return Err(Error::Capability(CapabilityError {
             model: model_id,
+            suggestions: Vec::new(),
             missing: MissingCapability::StructuredOutput,
         }));
     }
     if request.options.reasoning_enabled == Some(true) && caps.reasoning == crate::capabilities::ReasoningMode::None {
         return Err(Error::Capability(CapabilityError {
             model: model_id,
+            suggestions: Vec::new(),
             missing: MissingCapability::Reasoning,
         }));
     }
@@ -90,6 +93,7 @@ fn check(caps: &Capabilities, request: &ChatRequest, model: &str) -> Result<(), 
         if !caps.supports_reasoning_effort(&effort.0) {
             return Err(Error::Capability(CapabilityError {
                 model: model_id,
+                suggestions: Vec::new(),
                 missing: MissingCapability::ReasoningEffort(effort.0.clone()),
             }));
         }

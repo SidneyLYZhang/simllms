@@ -53,6 +53,17 @@ pub fn chat_body(
             ),
         );
     }
+    if let Some(schema) = &options.response_schema {
+        // Native-only (ADR-0004): the schema reaches the provider as a
+        // schema-constrained response_format, never as prompt text.
+        body.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": "response", "strict": true, "schema": schema }
+            }),
+        );
+    }
     for (k, v) in &options.extra {
         body.insert(k.clone(), v.clone());
     }

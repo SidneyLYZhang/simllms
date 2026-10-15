@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::catalog::Catalog;
 use crate::capabilities::{CapabilityOverrides, ResolvedCapabilities};
 use crate::dialect;
-use crate::error::{ApiError, ConfigError, Error, TransportError};
+use crate::error::{ApiError, CapabilityError, ConfigError, Error, MissingCapability, TransportError};
 use crate::gate::{self, ChatRequest};
 use crate::message::Message;
 use crate::options::Options;
@@ -198,7 +198,7 @@ impl Client {
         let request = ChatRequest { messages, options: merged, stream: false };
 
         let resolved = self.resolve();
-        gate::gate(&resolved, &request, self.provider, &self.model)?;
+        gate::gate(&resolved, &request, self.provider, &self.model).map_err(|e| self.enrich(e))?;
 
         let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, false);
         self.send(&body).await
@@ -220,7 +220,7 @@ impl Client {
         let request = ChatRequest { messages, options: merged, stream: true };
 
         let resolved = self.resolve();
-        gate::gate(&resolved, &request, self.provider, &self.model)?;
+        gate::gate(&resolved, &request, self.provider, &self.model).map_err(|e| self.enrich(e))?;
 
         let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
         let url = self.url();
@@ -276,6 +276,22 @@ impl Client {
         match &self.auth {
             Auth::Bearer => request.bearer_auth(&self.api_key),
             Auth::Header { name, value } => request.header(name, value),
+        }
+    }
+
+    /// Makes a Gate refusal actionable: for structured-output refusals the
+    /// Catalog names capable models on the same provider, when it knows any.
+    fn enrich(&self, error: Error) -> Error {
+        match error {
+            Error::Capability(ce)
+                if ce.missing == MissingCapability::StructuredOutput && ce.suggestions.is_empty() =>
+            {
+                Error::Capability(CapabilityError {
+                    suggestions: default_catalog().models_with(self.provider, |c| c.structured_output),
+                    ..ce
+                })
+            }
+            other => other,
         }
     }
 
@@ -943,5 +959,84 @@ mod tests {
         // CN remains the default.
         let client = Client::new(Provider::Zhipu, "glm-5.3", "sk");
         assert_eq!(client.url(), "https://open.bigmodel.cn/api/paas/v4/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn structured_output_uses_native_response_format() {
+        let mut server = Server::new_async().await;
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "integer" } },
+            "required": ["answer"]
+        });
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "response", "strict": true, "schema": schema }
+                }
+            })))
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url());
+        client
+            .chat_with(
+                vec![Message::text("give an answer")],
+                Options { response_schema: Some(schema), ..Default::default() },
+            )
+            .await
+            .expect("capable model must serve the schema");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn structured_output_refused_locally_with_suggestions() {
+        // glm-5 has structured_output=false in the real snapshot.
+        let client = Client::new(Provider::Zhipu, "glm-5", "sk-test");
+        // No mockito server exists: any network attempt fails as Transport.
+        let err = client
+            .chat_with(
+                vec![Message::text("give an answer")],
+                Options { response_schema: Some(serde_json::json!({"type": "object"})), ..Default::default() },
+            )
+            .await
+            .expect_err("glm-5 must be refused locally");
+        match err {
+            Error::Capability(e) => {
+                assert_eq!(e.model, "glm-5");
+                assert_eq!(e.missing, MissingCapability::StructuredOutput);
+                assert!(
+                    e.suggestions.contains(&"glm-5.3".to_string()),
+                    "suggestions must name capable models, got {:?}",
+                    e.suggestions
+                );
+            }
+            other => panic!("expected Capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_prompt_simulation_path_exists() {
+        // The schema appears only in response_format; messages are untouched
+        // and no JSON instructions are injected anywhere in the body.
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test");
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let rendered = client.debug_request(
+            &[Message::text("give an answer")],
+            &Options { response_schema: Some(schema), ..Default::default() },
+        );
+        let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let messages = body.get("messages").expect("messages present");
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["content"], "give an answer");
+        assert_eq!(body.pointer("/response_format/type"), Some(&serde_json::json!("json_schema")));
+        let outside_messages = rendered.split("\"messages\"").next().unwrap_or("");
+        assert!(
+            !outside_messages.to_lowercase().contains("json"),
+            "no prompt text may mention json outside response_format"
+        );
     }
 }

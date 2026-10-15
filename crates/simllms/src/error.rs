@@ -12,11 +12,33 @@ pub enum MissingCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("model `{model}` cannot serve this request: missing capability {missing:?}")]
 #[non_exhaustive]
 pub struct CapabilityError {
     pub model: String,
     pub missing: MissingCapability,
+    /// When the Catalog knows capable models on the same provider, they are
+    /// named here — the fix should be one edit away.
+    pub suggestions: Vec<String>,
+}
+
+impl std::fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model `{}` cannot serve this request: missing capability {:?}",
+            self.model, self.missing
+        )?;
+        if !self.suggestions.is_empty() {
+            write!(f, "; capable models on this provider: {}", self.suggestions.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl CapabilityError {
+    pub fn without_suggestions(model: impl Into<String>, missing: MissingCapability) -> Self {
+        CapabilityError { model: model.into(), missing, suggestions: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -90,6 +112,7 @@ mod tests {
         assert!(!Error::Capability(CapabilityError {
             model: "m".into(),
             missing: MissingCapability::ImageInput,
+            suggestions: Vec::new(),
         })
         .is_retryable());
     }
