@@ -11,7 +11,9 @@ repository.workspace = true
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 base64 = "0.22"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "charset"] }
+bytes = "1"
+futures-core = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "charset", "stream"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "time", "macros"] }
 tracing = { version = "0.1", optional = true }
 

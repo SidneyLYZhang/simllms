@@ -15,6 +15,7 @@ pub mod message;
 pub mod options;
 pub mod provider;
 pub mod reply;
+pub mod stream;
 
 pub use capabilities::{Capabilities, CapabilityOverrides, Modality, ModelStatus, ReasoningMode, ResolvedCapabilities, Source};
 pub use catalog::Catalog;
@@ -25,3 +26,4 @@ pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use options::{Options, ReasoningEffort};
 pub use provider::Provider;
 pub use reply::{Reply, Usage};
+pub use stream::{ChatStream, Chunk, Delta};

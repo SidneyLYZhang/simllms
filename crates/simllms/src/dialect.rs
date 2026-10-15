@@ -11,6 +11,7 @@ pub fn chat_body(
     model: &str,
     messages: &[Message],
     options: &Options,
+    stream: bool,
 ) -> serde_json::Value {
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::Value::String(model.to_string()));
@@ -18,6 +19,13 @@ pub fn chat_body(
         "messages".into(),
         serde_json::Value::Array(messages.iter().map(translate_message).collect()),
     );
+    if stream {
+        body.insert("stream".into(), serde_json::Value::Bool(true));
+        body.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
 
     let scalar: [(&str, Option<serde_json::Value>); 9] = [
         ("temperature", options.temperature.map(|v| v.into())),

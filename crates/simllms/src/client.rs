@@ -32,6 +32,8 @@ impl RetryPolicy {
 }
 
 const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn default_catalog() -> &'static Catalog {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
@@ -48,6 +50,8 @@ pub struct Client {
     overrides: CapabilityOverrides,
     retry: RetryPolicy,
     timeout: Duration,
+    stream_first_token_timeout: Duration,
+    stream_idle_timeout: Duration,
     http: reqwest::Client,
 }
 
@@ -62,6 +66,8 @@ impl Client {
             overrides: CapabilityOverrides::default(),
             retry: RetryPolicy::default(),
             timeout: DEFAULT_CHAT_TIMEOUT,
+            stream_first_token_timeout: DEFAULT_FIRST_TOKEN_TIMEOUT,
+            stream_idle_timeout: DEFAULT_IDLE_TIMEOUT,
             http: reqwest::Client::builder()
                 .build()
                 .expect("reqwest client with rustls should always build"),
@@ -93,11 +99,23 @@ impl Client {
         self
     }
 
+    /// Overrides the streaming timeouts: the first event must arrive within
+    /// `first_token`, and every subsequent event within `idle`.
+    pub fn with_stream_timeouts(
+        mut self,
+        first_token: Duration,
+        idle: Duration,
+    ) -> Self {
+        self.stream_first_token_timeout = first_token;
+        self.stream_idle_timeout = idle;
+        self
+    }
+
     /// Renders the exact JSON body a Chat would send, without sending it and
     /// without any credential material — the api key travels only in the
     /// Authorization header, which never appears here.
     pub fn debug_request(&self, messages: &[Message], options: &Options) -> String {
-        let body = dialect::chat_body(self.provider, &self.model, messages, options);
+        let body = dialect::chat_body(self.provider, &self.model, messages, options, false);
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
     }
 
@@ -114,8 +132,58 @@ impl Client {
         let resolved = self.resolve();
         gate::gate(&resolved, &request, self.provider, &self.model)?;
 
-        let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options);
+        let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, false);
         self.send(&body).await
+    }
+
+    /// Streaming variant of `chat`: same Client, same Gate, same dialect.
+    /// The returned `ChatStream` normalizes every provider into the same
+    /// chunk sequence; dropping it cancels the request.
+    pub async fn chat_stream(&self, messages: Vec<Message>) -> Result<crate::stream::ChatStream, Error> {
+        self.chat_stream_with(messages, Options::default()).await
+    }
+
+    pub async fn chat_stream_with(
+        &self,
+        messages: Vec<Message>,
+        options: Options,
+    ) -> Result<crate::stream::ChatStream, Error> {
+        let merged = Options::layered(self.options.clone(), options);
+        let request = ChatRequest { messages, options: merged, stream: true };
+
+        let resolved = self.resolve();
+        gate::gate(&resolved, &request, self.provider, &self.model)?;
+
+        let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
+        let url = self.url();
+        let response = self
+            .http
+            .post(&url)
+            .timeout(self.timeout)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let raw_body = response
+                .text()
+                .await
+                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            return Err(Error::Api(ApiError {
+                status,
+                provider_message: extract_provider_message(&raw_body),
+                raw_body,
+            }));
+        }
+
+        Ok(crate::stream::ChatStream::new(
+            response,
+            self.stream_first_token_timeout,
+            self.stream_idle_timeout,
+        ))
     }
 
     fn resolve(&self) -> ResolvedCapabilities {
@@ -466,5 +534,170 @@ mod tests {
             ResolvedCapabilities::Known(c) => assert!(c.input_modalities.contains(&Modality::Image)),
             other => panic!("kimi-k3 must be known, got {other:?}"),
         }
+    }
+
+    fn sse_body() -> String {
+        let mut s = String::new();
+        for event in [
+            r#"{"choices":[{"index":0,"delta":{"content":"He"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"llo"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"hmm"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        ] {
+            s.push_str(&format!("data: {event}\n\n"));
+        }
+        s.push_str("data: [DONE]\n\n");
+        s
+    }
+
+    #[tokio::test]
+    async fn stream_replays_normalized_chunks_with_final_usage() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "stream": true,
+                "stream_options": { "include_usage": true }
+            })))
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body())
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url());
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+
+        let mut deltas = Vec::new();
+        let mut last_usage = None;
+        let mut finish = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may fail");
+            deltas.push(chunk.delta);
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+            }
+            if let Some(u) = chunk.usage {
+                last_usage = Some(u);
+            }
+        }
+        mock.assert_async().await;
+
+        assert_eq!(
+            deltas,
+            vec![
+                Some(crate::stream::Delta::Text { text: "He".into() }),
+                Some(crate::stream::Delta::Text { text: "llo".into() }),
+                Some(crate::stream::Delta::Reasoning { text: "hmm".into() }),
+                None,
+            ]
+        );
+        assert_eq!(finish.as_deref(), Some("stop"));
+        assert_eq!(last_usage.map(|u| u.total_tokens), Some(Some(5)));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_provider_error_surfaces_as_api_after_partial_content() {
+        let mut server = Server::new_async().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {{\"error\":{{\"message\":\"overloaded mid-stream\"}}}}\n\n",
+            r#"{"choices":[{"delta":{"content":"par"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"tial"}}]}"#,
+        );
+        server
+            .mock("POST", "/chat/completions")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url());
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+
+        let mut partial = String::new();
+        let err = loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(crate::stream::Delta::Text { text }) = chunk.delta {
+                        partial.push_str(&text);
+                    }
+                }
+                Some(Err(e)) => break e,
+                None => panic!("expected a mid-stream error"),
+            }
+        };
+
+        assert_eq!(partial, "partial");
+        match err {
+            Error::Api(e) => {
+                assert!(e.provider_message.contains("overloaded mid-stream"));
+                assert!(e.raw_body.contains("overloaded mid-stream"));
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_timeout_enforced_and_overridable() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_chunked_body(|w| {
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n");
+                Ok(())
+            })
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url())
+            .with_stream_timeouts(Duration::from_millis(50), Duration::from_secs(90));
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let err = stream.next().await.expect("must yield an item").expect_err("must be a timeout");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+        assert!(err.to_string().contains("first stream event"));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_enforced_and_overridable() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_chunked_body(|w| {
+                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"soon\"}}]}\n\n");
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"too late\"}}]}\n\n");
+                Ok(())
+            })
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url())
+            .with_stream_timeouts(Duration::from_secs(60), Duration::from_millis(50));
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+
+        let first = stream.next().await.expect("first chunk").expect("first chunk ok");
+        assert!(matches!(first.delta, Some(crate::stream::Delta::Text { ref text }) if text == "soon"));
+        let err = stream.next().await.expect("must yield an item").expect_err("must be idle timeout");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+        assert!(err.to_string().contains("idle timeout"));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_stream_does_not_hang() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_body(sse_body())
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url());
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let _ = stream.next().await;
+        drop(stream); // cancels the request; must not block or panic
     }
 }
