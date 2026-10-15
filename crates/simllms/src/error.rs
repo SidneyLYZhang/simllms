@@ -1,0 +1,66 @@
+/// What the Gate found missing. Naming the missing Capability is the point:
+/// the fix should be one edit away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MissingCapability {
+    ImageInput,
+    StructuredOutput,
+    Reasoning,
+    ReasoningEffort(String),
+    ImageGeneration,
+    ToolCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("model `{model}` cannot serve this request: missing capability {missing:?}")]
+#[non_exhaustive]
+pub struct CapabilityError {
+    pub model: String,
+    pub missing: MissingCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+#[non_exhaustive]
+pub struct ConfigError {
+    pub message: String,
+}
+
+/// Carries the provider's answer untouched: `raw_body` is the evidence you
+/// take to their support, never a reformatting of it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("provider returned {status}: {provider_message}")]
+#[non_exhaustive]
+pub struct ApiError {
+    pub status: u16,
+    pub provider_message: String,
+    pub raw_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+#[non_exhaustive]
+pub struct TransportError {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("capability gate refused: {0}")]
+    Capability(#[from] CapabilityError),
+    #[error("invalid configuration: {0}")]
+    Config(#[from] ConfigError),
+    #[error("provider api error: {0}")]
+    Api(#[from] ApiError),
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+}
+
+impl Error {
+    /// Capability and Config are local: they never reach the network and are
+    /// never retried. Api and Transport may be.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::Api(_) | Error::Transport(_))
+    }
+}
