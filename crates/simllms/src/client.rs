@@ -279,6 +279,204 @@ impl Client {
         }
     }
 
+    /// Generates images. Zhipu answers synchronously with URLs, OpenRouter
+    /// synchronously with base64 bytes, and DashScope through a fully
+    /// internal submit-then-poll lifecycle (bounded by `knobs.timeout`,
+    /// paced by `knobs.poll_interval`). Capability and parameter checks run
+    /// locally before any network call.
+    pub async fn generate_image(
+        &self,
+        request: crate::image::ImageRequest,
+    ) -> Result<crate::image::ImageReply, Error> {
+        self.generate_image_with(request, crate::image::ImageKnobs::default()).await
+    }
+
+    pub async fn generate_image_with(
+        &self,
+        request: crate::image::ImageRequest,
+        knobs: crate::image::ImageKnobs,
+    ) -> Result<crate::image::ImageReply, Error> {
+        let resolved = default_catalog().resolve(self.provider, &self.model);
+        let image_generation = match &resolved {
+            ResolvedCapabilities::Known(caps) => {
+                self.overrides.image_generation.unwrap_or(caps.image_generation)
+            }
+            // Catalog miss warns and passes (ADR-0005); the capability check
+            // is skipped but the parameter checks still run.
+            ResolvedCapabilities::Unknown => true,
+        };
+        crate::image::check(image_generation, self.provider, &self.model, &request)
+            .map_err(|e| self.enrich(e))?;
+
+        match self.provider {
+            Provider::Zhipu => {
+                let url = format!("{}/images/generations", self.url().trim_end_matches("/chat/completions"));
+                self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
+                    .await
+            }
+            Provider::OpenRouter => {
+                let url = format!("{}/images", self.url().trim_end_matches("/chat/completions"));
+                self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
+                    .await
+            }
+            Provider::DashScope => {
+                self.image_dashscope(request, knobs).await
+            }
+            _ => Err(Error::Capability(CapabilityError::without_suggestions(
+                &self.model,
+                MissingCapability::ImageGeneration,
+            ))),
+        }
+    }
+
+    /// The DashScope native root: the client's base_url minus the
+    /// compatible-mode suffix, so region/workspace domains both work.
+    fn dashscope_root(&self) -> String {
+        self.url()
+            .trim_end_matches("/chat/completions")
+            .trim_end_matches("/compatible-mode/v1")
+            .to_string()
+    }
+
+    async fn image_sync(
+        &self,
+        url: String,
+        body: serde_json::Value,
+    ) -> Result<crate::image::ImageReply, Error> {
+        let request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let status = response.status().as_u16();
+        let raw_body = response
+            .text()
+            .await
+            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Api(ApiError {
+                status,
+                provider_message: extract_provider_message(&raw_body),
+                raw_body,
+            }));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
+            Error::Api(ApiError {
+                status,
+                provider_message: format!("malformed image response: {e}"),
+                raw_body: raw_body.clone(),
+            })
+        })?;
+        crate::image::parse_sync(self.provider, &parsed)
+    }
+
+    async fn image_dashscope(
+        &self,
+        request: crate::image::ImageRequest,
+        knobs: crate::image::ImageKnobs,
+    ) -> Result<crate::image::ImageReply, Error> {
+        let root = self.dashscope_root();
+        let submit_url = format!("{root}/api/v1/services/aigc/text2image/image-synthesis");
+        let body = crate::image::translate(self.provider, &self.model, &request);
+
+        let submit = self
+            .apply_auth(self.http.post(&submit_url).timeout(self.timeout).json(&body))
+            .header("X-DashScope-Async", "enable");
+        let response = submit
+            .send()
+            .await
+            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let status = response.status().as_u16();
+        let raw = response
+            .text()
+            .await
+            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Api(ApiError {
+                status,
+                provider_message: extract_provider_message(&raw),
+                raw_body: raw,
+            }));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            Error::Api(ApiError { status, provider_message: format!("malformed submit response: {e}"), raw_body: raw })
+        })?;
+        let task_id = parsed
+            .pointer("/output/task_id")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| Error::Api(ApiError {
+                status,
+                provider_message: "submit response has no output.task_id".into(),
+                raw_body: parsed.to_string(),
+            }))?
+            .to_string();
+
+        let poll_url = format!("{root}/api/v1/tasks/{task_id}");
+        let deadline = std::time::Instant::now() + knobs.timeout;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Transport(TransportError {
+                    message: format!(
+                        "image task {task_id} did not finish within {:?}",
+                        knobs.timeout
+                    ),
+                }));
+            }
+            tokio::time::sleep(knobs.poll_interval).await;
+            let poll = self.apply_auth(self.http.get(&poll_url).timeout(self.timeout));
+            let response = poll
+                .send()
+                .await
+                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            let status = response.status().as_u16();
+            let raw = response
+                .text()
+                .await
+                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            if !(200..300).contains(&status) {
+                return Err(Error::Api(ApiError {
+                    status,
+                    provider_message: extract_provider_message(&raw),
+                    raw_body: raw,
+                }));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                Error::Api(ApiError { status, provider_message: format!("malformed poll response: {e}"), raw_body: raw })
+            })?;
+            match parsed.pointer("/output/task_status").and_then(|s| s.as_str()) {
+                Some("SUCCEEDED") => {
+                    let urls: Vec<String> = parsed
+                        .pointer("/output/results")
+                        .and_then(|r| r.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|i| i.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    return Ok(crate::image::ImageReply {
+                        images: urls
+                            .into_iter()
+                            .map(|url| crate::image::GeneratedImage { url: Some(url), ..Default::default() })
+                            .collect(),
+                    });
+                }
+                Some("FAILED" | "CANCELED" | "UNKNOWN") => {
+                    return Err(Error::Api(ApiError {
+                        status: 0, // no HTTP failure: the provider reported it in the body
+                        provider_message: parsed
+                            .pointer("/output/message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("image task failed")
+                            .to_string(),
+                        raw_body: parsed.to_string(),
+                    }));
+                }
+                _ => continue, // PENDING / RUNNING
+            }
+        }
+    }
+
     /// Makes a Gate refusal actionable: for structured-output refusals the
     /// Catalog names capable models on the same provider, when it knows any.
     fn enrich(&self, error: Error) -> Error {
@@ -1038,5 +1236,157 @@ mod tests {
             !outside_messages.to_lowercase().contains("json"),
             "no prompt text may mention json outside response_format"
         );
+    }
+
+    #[tokio::test]
+    async fn zhipu_image_generation_returns_urls() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/images/generations")
+            .match_header("authorization", "Bearer sk-glm")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "model": "cogview-4",
+                "prompt": "a cat"
+            })))
+            .with_body(serde_json::json!({ "data": [{ "url": "https://img.example/cat.png" }] }).to_string())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::Zhipu, "cogview-4", "sk-glm")
+            .with_base_url(server.url());
+        let reply = client.generate_image(crate::image::ImageRequest::new("a cat")).await.expect("must succeed");
+        mock.assert_async().await;
+        assert_eq!(reply.images.len(), 1);
+        assert_eq!(reply.images[0].url.as_deref(), Some("https://img.example/cat.png"));
+        assert!(reply.images[0].data.is_none());
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_generation_returns_bytes() {
+        let mut server = Server::new_async().await;
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG-data");
+        let mock = server
+            .mock("POST", "/images")
+            .match_header("authorization", "Bearer sk-or")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "prompt": "a cat" })))
+            .with_body(serde_json::json!({ "data": [{ "b64_json": b64 }] }).to_string())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::OpenRouter, "google/gemini-image", "sk-or")
+            .with_base_url(server.url());
+        let reply = client.generate_image(crate::image::ImageRequest::new("a cat")).await.expect("must succeed");
+        mock.assert_async().await;
+        assert_eq!(reply.images[0].data.as_deref(), Some(&b"\x89PNG-data"[..]));
+        assert!(reply.images[0].url.is_none());
+    }
+
+    #[tokio::test]
+    async fn dashscope_image_generation_polls_to_success() {
+        let mut server = Server::new_async().await;
+        let submit = server
+            .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
+            .match_header("X-DashScope-Async", "enable")
+            .match_header("authorization", "Bearer sk-dash")
+            .with_body(serde_json::json!({ "output": { "task_id": "t-1", "task_status": "PENDING" } }).to_string())
+            .create_async()
+            .await;
+        // First poll is still PENDING, second succeeds — full lifecycle.
+        let pending = server
+            .mock("GET", "/api/v1/tasks/t-1")
+            .with_body(serde_json::json!({ "output": { "task_status": "PENDING" } }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let done = server
+            .mock("GET", "/api/v1/tasks/t-1")
+            .with_body(serde_json::json!({
+                "output": { "task_status": "SUCCEEDED", "results": [{ "url": "https://img.example/q.png" }] }
+            }).to_string())
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DashScope, "wanx2.1-t2i-turbo", "sk-dash")
+            .with_base_url(format!("{}/compatible-mode/v1", server.url()));
+        let knobs = crate::image::ImageKnobs {
+            timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(10),
+        };
+        let reply = client
+            .generate_image_with(crate::image::ImageRequest::new("a cat"), knobs)
+            .await
+            .expect("must succeed");
+        submit.assert_async().await;
+        pending.assert_async().await;
+        done.assert_async().await;
+        assert_eq!(reply.images[0].url.as_deref(), Some("https://img.example/q.png"));
+    }
+
+    #[tokio::test]
+    async fn dashscope_failed_task_surfaces_the_reason() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
+            .with_body(serde_json::json!({ "output": { "task_id": "t-2", "task_status": "PENDING" } }).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/v1/tasks/t-2")
+            .with_body(serde_json::json!({
+                "output": { "task_status": "FAILED", "message": "sensitive content detected" }
+            }).to_string())
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DashScope, "wanx2.1-t2i-turbo", "sk-dash")
+            .with_base_url(format!("{}/compatible-mode/v1", server.url()));
+        let knobs = crate::image::ImageKnobs {
+            timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(10),
+        };
+        let err = client
+            .generate_image_with(crate::image::ImageRequest::new("x"), knobs)
+            .await
+            .expect_err("failed task must surface");
+        match err {
+            Error::Api(e) => assert_eq!(e.provider_message, "sensitive content detected"),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dashscope_poll_timeout_is_enforced() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
+            .with_body(serde_json::json!({ "output": { "task_id": "t-3", "task_status": "PENDING" } }).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/v1/tasks/t-3")
+            .with_body(serde_json::json!({ "output": { "task_status": "RUNNING" } }).to_string())
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DashScope, "wanx2.1-t2i-turbo", "sk-dash")
+            .with_base_url(format!("{}/compatible-mode/v1", server.url()));
+        let knobs = crate::image::ImageKnobs {
+            timeout: Duration::from_millis(80),
+            poll_interval: Duration::from_millis(10),
+        };
+        let err = client
+            .generate_image_with(crate::image::ImageRequest::new("x"), knobs)
+            .await
+            .expect_err("must time out");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn image_generation_refuses_locally_for_capability_less_providers() {
+        // No mockito server: any network attempt would surface as Transport.
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test");
+        let err = client
+            .generate_image(crate::image::ImageRequest::new("a cat"))
+            .await
+            .expect_err("must refuse locally");
+        assert!(matches!(err, Error::Capability(e) if e.missing == MissingCapability::ImageGeneration));
     }
 }
