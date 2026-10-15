@@ -72,6 +72,7 @@ pub struct Client {
     timeout: Duration,
     stream_first_token_timeout: Duration,
     stream_idle_timeout: Duration,
+    default_headers: Vec<(String, String)>,
     http: reqwest::Client,
 }
 
@@ -90,6 +91,7 @@ impl Client {
             timeout: DEFAULT_CHAT_TIMEOUT,
             stream_first_token_timeout: DEFAULT_FIRST_TOKEN_TIMEOUT,
             stream_idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            default_headers: Vec::new(),
             http: reqwest::Client::builder()
                 .build()
                 .expect("reqwest client with rustls should always build"),
@@ -144,6 +146,17 @@ impl Client {
     pub fn with_zhipu_international(mut self) -> Self {
         debug_assert_eq!(self.provider, Provider::Zhipu);
         self.base_url = Some("https://api.z.ai/api/paas/v4".into());
+        self
+    }
+
+    /// Adds a header sent on every request (chat, streaming, images).
+    /// The auth header is applied after these, so it wins on collision.
+    pub fn with_default_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.default_headers.push((name.into(), value.into()));
         self
     }
 
@@ -223,7 +236,7 @@ impl Client {
         gate::gate(&resolved, &request, self.provider, &self.model).map_err(|e| self.enrich(e))?;
 
         let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
-        let url = self.url();
+        let url = self.url()?;
         let mut request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
         // Qwen's streaming endpoints require an explicit SSE opt-in header;
         // harmless on compatible-mode, required on native mode.
@@ -256,23 +269,45 @@ impl Client {
     }
 
     fn resolve(&self) -> ResolvedCapabilities {
-        match default_catalog().resolve(self.provider, &self.model) {
-            ResolvedCapabilities::Known(base) if self.overrides != CapabilityOverrides::default() => {
-                ResolvedCapabilities::Known(self.overrides.apply_to(base))
+        let base = default_catalog().resolve(self.provider, &self.model);
+        if self.overrides == CapabilityOverrides::default() {
+            return base;
+        }
+        match base {
+            ResolvedCapabilities::Known(caps) => {
+                ResolvedCapabilities::Known(self.overrides.apply_to(caps))
             }
-            resolved => resolved,
+            // A user override turns an unknown gateway model into a Known
+            // record with the declared Capabilities (Source::User).
+            ResolvedCapabilities::Unknown => ResolvedCapabilities::Known(
+                self.overrides.apply_to(crate::capabilities::Capabilities::text_only(
+                    crate::capabilities::Source::Catalog,
+                )),
+            ),
         }
     }
 
-    fn url(&self) -> String {
+    fn url(&self) -> Result<String, Error> {
         let base = self
             .base_url
             .clone()
-            .unwrap_or_else(|| self.provider.default_base_url().to_string());
-        format!("{}/chat/completions", base.trim_end_matches('/'))
+            .or_else(|| self.provider.default_base_url().map(str::to_string))
+            .ok_or_else(|| {
+                Error::Config(ConfigError {
+                    message: format!(
+                        "provider `{}` has no default base url; call with_base_url()",
+                        self.provider
+                    ),
+                })
+            })?;
+        Ok(format!("{}/chat/completions", base.trim_end_matches('/')))
     }
 
     fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request;
+        for (name, value) in &self.default_headers {
+            request = request.header(name, value);
+        }
         match &self.auth {
             Auth::Bearer => request.bearer_auth(&self.api_key),
             Auth::Header { name, value } => request.header(name, value),
@@ -310,12 +345,15 @@ impl Client {
 
         match self.provider {
             Provider::Zhipu => {
-                let url = format!("{}/images/generations", self.url().trim_end_matches("/chat/completions"));
+                let url = format!(
+                    "{}/images/generations",
+                    self.url()?.trim_end_matches("/chat/completions")
+                );
                 self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
                     .await
             }
             Provider::OpenRouter => {
-                let url = format!("{}/images", self.url().trim_end_matches("/chat/completions"));
+                let url = format!("{}/images", self.url()?.trim_end_matches("/chat/completions"));
                 self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
                     .await
             }
@@ -331,11 +369,12 @@ impl Client {
 
     /// The DashScope native root: the client's base_url minus the
     /// compatible-mode suffix, so region/workspace domains both work.
-    fn dashscope_root(&self) -> String {
-        self.url()
+    fn dashscope_root(&self) -> Result<String, Error> {
+        Ok(self
+            .url()?
             .trim_end_matches("/chat/completions")
             .trim_end_matches("/compatible-mode/v1")
-            .to_string()
+            .to_string())
     }
 
     async fn image_sync(
@@ -375,7 +414,7 @@ impl Client {
         request: crate::image::ImageRequest,
         knobs: crate::image::ImageKnobs,
     ) -> Result<crate::image::ImageReply, Error> {
-        let root = self.dashscope_root();
+        let root = self.dashscope_root()?;
         let submit_url = format!("{root}/api/v1/services/aigc/text2image/image-synthesis");
         let body = crate::image::translate(self.provider, &self.model, &request);
 
@@ -477,6 +516,20 @@ impl Client {
         }
     }
 
+    /// Preview of what the Gate would warn about — e.g. an unknown gateway
+    /// model — without sending anything. Refusals surface as errors here.
+    pub fn warnings(&self, messages: &[Message], options: &Options) -> Vec<gate::Warning> {
+        let request = ChatRequest {
+            messages: messages.to_vec(),
+            options: options.clone(),
+            stream: false,
+        };
+        let resolved = self.resolve();
+        gate::gate(&resolved, &request, self.provider, &self.model)
+            .map(|outcome| outcome.warnings)
+            .unwrap_or_default()
+    }
+
     /// Makes a Gate refusal actionable: for structured-output refusals the
     /// Catalog names capable models on the same provider, when it knows any.
     fn enrich(&self, error: Error) -> Error {
@@ -503,7 +556,7 @@ impl Client {
         #[cfg(feature = "tracing")]
         let _guard = span.enter();
 
-        let url = self.url();
+        let url = self.url()?;
         let mut attempt = 1u32;
         loop {
             match self.send_once(&url, body).await {
@@ -1129,7 +1182,7 @@ mod tests {
                 region: crate::provider::DASHSCOPE_AP_SOUTHEAST_1,
             });
         assert_eq!(
-            client.url(),
+            client.url().expect("built-in provider has a base url"),
             "https://llm-xxx.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
         );
     }
@@ -1153,10 +1206,10 @@ mod tests {
     #[test]
     fn zhipu_international_host_selectable() {
         let client = Client::new(Provider::Zhipu, "glm-5.3", "sk").with_zhipu_international();
-        assert_eq!(client.url(), "https://api.z.ai/api/paas/v4/chat/completions");
+        assert_eq!(client.url().expect("url"), "https://api.z.ai/api/paas/v4/chat/completions");
         // CN remains the default.
         let client = Client::new(Provider::Zhipu, "glm-5.3", "sk");
-        assert_eq!(client.url(), "https://open.bigmodel.cn/api/paas/v4/chat/completions");
+        assert_eq!(client.url().expect("url"), "https://open.bigmodel.cn/api/paas/v4/chat/completions");
     }
 
     #[tokio::test]
@@ -1388,5 +1441,137 @@ mod tests {
             .await
             .expect_err("must refuse locally");
         assert!(matches!(err, Error::Capability(e) if e.missing == MissingCapability::ImageGeneration));
+    }
+
+    #[tokio::test]
+    async fn custom_provider_with_bearer_and_header_auth() {
+        for (name, matcher) in [
+            ("bearer", "Bearer sk-gw"),
+            ("header", "x-token: sk-gw"),
+        ] {
+            let mut server = Server::new_async().await;
+            let mut mock = server
+                .mock("POST", "/chat/completions")
+                .match_body(Matcher::PartialJson(serde_json::json!({
+                    "model": "my-gateway-model"
+                })))
+                .with_body(success_body());
+            mock = if name == "bearer" {
+                mock.match_header("authorization", matcher)
+            } else {
+                mock.match_header("x-token", "sk-gw")
+            };
+            let mock = mock.create_async().await;
+
+            let base = Client::new(Provider::Custom, "my-gateway-model", "sk-gw")
+                .with_base_url(server.url());
+            let client = if name == "bearer" {
+                base
+            } else {
+                base.with_auth(Auth::Header { name: "x-token".into(), value: "sk-gw".into() })
+            };
+            client.chat(vec![Message::text("hello")]).await.expect("gateway chat must succeed");
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn default_headers_sent_on_every_request() {
+        let mut server = Server::new_async().await;
+        let chat = server
+            .mock("POST", "/chat/completions")
+            .match_header("x-correlation-id", "simllms-test")
+            .with_body(success_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let sse = server
+            .mock("POST", "/chat/completions")
+            .match_header("x-correlation-id", "simllms-test")
+            .with_body(sse_body())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::Custom, "my-gateway-model", "sk")
+            .with_base_url(server.url())
+            .with_default_header("x-correlation-id", "simllms-test");
+        client.chat(vec![Message::text("hello")]).await.expect("chat ok");
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream ok");
+        while stream.next().await.is_some() {}
+        chat.assert_async().await;
+        sse.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn custom_unknown_model_warns_and_passes_end_to_end() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::Custom, "totally-unknown-model", "sk")
+            .with_base_url(server.url());
+
+        let warns = client.warnings(&[Message::text("hello")], &Options::default());
+        assert!(matches!(warns.as_slice(), [gate::Warning::UnknownModel { .. }]));
+
+        let reply = client.chat(vec![Message::text("hello")]).await.expect("warn-and-pass");
+        assert_eq!(reply.content, "hi there");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn custom_user_override_tightens_unknown_model() {
+        let client = Client::new(Provider::Custom, "totally-unknown-model", "sk")
+            .with_base_url("http://127.0.0.1:1")
+            .with_capability_overrides(crate::capabilities::CapabilityOverrides {
+                structured_output: Some(false),
+                ..Default::default()
+            });
+        let warns = client.warnings(&[Message::text("hello")], &Options::default());
+        assert!(warns.is_empty(), "override turns unknown into Known");
+        // No server: any network attempt surfaces as Transport, not Capability —
+        // proving the refusal is local.
+        let err = client
+            .chat_with(
+                vec![Message::text("hello")],
+                Options { response_schema: Some(serde_json::json!({"type": "object"})), ..Default::default() },
+            )
+            .await
+            .expect_err("tightened override must refuse");
+        assert!(matches!(err, Error::Capability(e) if e.missing == MissingCapability::StructuredOutput));
+    }
+
+    #[tokio::test]
+    async fn custom_without_base_url_is_a_config_error() {
+        let client = Client::new(Provider::Custom, "m", "sk");
+        let err = client.chat(vec![Message::text("hello")]).await.expect_err("must fail locally");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        assert!(err.to_string().contains("with_base_url"));
+    }
+
+    #[tokio::test]
+    async fn custom_retry_behaves_like_builtins() {
+        let mut server = Server::new_async().await;
+        let failing = server
+            .mock("POST", "/chat/completions")
+            .with_status(503)
+            .with_body(r#"{"error":{"message":"down"}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("POST", "/chat/completions")
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::Custom, "my-gateway-model", "sk")
+            .with_base_url(server.url());
+        let reply = client.chat(vec![Message::text("hello")]).await.expect("retry must recover");
+        failing.assert_async().await;
+        ok.assert_async().await;
+        assert_eq!(reply.content, "hi there");
     }
 }

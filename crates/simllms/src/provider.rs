@@ -6,6 +6,10 @@ pub enum Provider {
     Zhipu,
     MiMo,
     OpenRouter,
+    /// Any OpenAI-compatible endpoint: self-hosted vLLM, One-API, corporate
+    /// gateway. Requires `Client::with_base_url`; gateway models appear in
+    /// no Catalog and must not be rejected (ADR-0005 warn-and-pass).
+    Custom,
 }
 
 impl std::fmt::Display for Provider {
@@ -17,6 +21,7 @@ impl std::fmt::Display for Provider {
             Provider::Zhipu => "zhipu",
             Provider::MiMo => "mimo",
             Provider::OpenRouter => "openrouter",
+            Provider::Custom => "custom",
         };
         f.write_str(name)
     }
@@ -25,14 +30,15 @@ impl std::fmt::Display for Provider {
 /// The provider's documented OpenAI-compatible root. A Client may always
 /// override this with its own `base_url`.
 impl Provider {
-    pub fn default_base_url(self) -> &'static str {
+    pub fn default_base_url(self) -> Option<&'static str> {
         match self {
-            Provider::DeepSeek => "https://api.deepseek.com",
-            Provider::Moonshot => "https://api.moonshot.cn/v1",
-            Provider::DashScope => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            Provider::Zhipu => "https://open.bigmodel.cn/api/paas/v4",
-            Provider::MiMo => "https://api.xiaomimimo.com/v1",
-            Provider::OpenRouter => "https://openrouter.ai/api/v1",
+            Provider::DeepSeek => Some("https://api.deepseek.com"),
+            Provider::Moonshot => Some("https://api.moonshot.cn/v1"),
+            Provider::DashScope => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            Provider::Zhipu => Some("https://open.bigmodel.cn/api/paas/v4"),
+            Provider::MiMo => Some("https://api.xiaomimimo.com/v1"),
+            Provider::OpenRouter => Some("https://openrouter.ai/api/v1"),
+            Provider::Custom => None,
         }
     }
 
@@ -46,6 +52,7 @@ impl Provider {
             Provider::Zhipu => "ZHIPU_API_KEY",
             Provider::MiMo => "MIMO_API_KEY",
             Provider::OpenRouter => "OPENROUTER_API_KEY",
+            Provider::Custom => "SIMLLMS_CUSTOM_API_KEY",
         }
     }
 }
