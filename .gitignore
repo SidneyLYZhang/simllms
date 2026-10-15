@@ -1,0 +1,11 @@
+/target
+
+# Python / maturin
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+
+# generated docs navigation copy of the root changelog
+/docs/changelog.md
