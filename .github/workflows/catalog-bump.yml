@@ -1,0 +1,52 @@
+name: Weekly catalog bump
+
+on:
+  schedule:
+    # Mondays 03:20 UTC — off the hour to dodge shared-runner crunch.
+    - cron: "20 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Regenerate capability snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Refresh catalog from models.dev
+        run: cargo xtask refresh-catalog
+      - name: Build the PR body
+        id: body
+        run: |
+          upstream_commit="$(jq -r '.meta.commit' catalog/modelsdev-snapshot.json)"
+          upstream_date="$(jq -r '.meta.date' catalog/modelsdev-snapshot.json)"
+          {
+            echo "## Upstream changes"
+            echo
+            echo "- Upstream snapshot: commit $upstream_commit, dated $upstream_date"
+            echo "- Raw upstream models: $(jq '[.providers[].models | length] | add' catalog/modelsdev-snapshot.json)"
+            echo
+            echo "## Generated diff"
+            echo '```'
+            git diff --stat
+            echo '```'
+            echo
+            echo "Review the diff on crates/simllms/src/catalog_data.rs (generated) and the hand-maintained image overrides in catalog.rs."
+          } > body.md
+          echo "path=body.md" >> "$GITHUB_OUTPUT"
+      - name: Open the bump PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          branch: catalog-bump
+          delete-branch: true
+          title: "chore(catalog): weekly models.dev snapshot refresh"
+          body-path: ${{ steps.body.outputs.path }}
+          commit-message: "chore(catalog): refresh models.dev snapshot"
+          # Deliberately no auto-merge: ADR-0002 — catalog changes never
+          # silently alter user behaviour; a human reads the diff first.

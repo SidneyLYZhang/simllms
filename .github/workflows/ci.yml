@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        # Workspace tests are hermetic: no live-provider calls, no network,
+        # no Python toolchain. Live smoke lives in examples/ (env-gated,
+        # manual only) and never runs here.
+        run: cargo test --workspace
+      - name: Generated catalog is in sync
+        run: cargo xtask refresh-catalog --check
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Build and install bindings
+        working-directory: crates/simllms-python
+        run: |
+          uv venv
+          uv pip install -e . pytest mypy
+      - name: pytest
+        working-directory: crates/simllms-python
+        run: uv run --no-sync pytest tests
+      - name: mypy (pure-Python layer)
+        working-directory: crates/simllms-python
+        run: uv run --no-sync mypy python/simllms tests/test_client.py

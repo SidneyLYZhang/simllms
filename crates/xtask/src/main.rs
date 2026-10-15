@@ -35,29 +35,29 @@ fn main() {
 }
 
 fn refresh_catalog(check: bool) {
-    let snapshot = fetch_snapshot();
-    let snapshot_json = serde_json::to_string_pretty(&snapshot).expect("snapshot serializes");
-    let code = generate_catalog_data(&snapshot);
-
     let snapshot_path = PathBuf::from(ROOT).join("catalog/modelsdev-snapshot.json");
     let data_path = PathBuf::from(ROOT).join("crates/simllms/src/catalog_data.rs");
 
     if check {
-        let mut dirty = false;
-        if fs::read_to_string(&snapshot_path).unwrap_or_default() != snapshot_json {
-            eprintln!("catalog/modelsdev-snapshot.json is out of date");
-            dirty = true;
-        }
+        // Offline consistency: the generated code must match the vendored
+        // snapshot. Staleness against upstream is the weekly bump's job —
+        // the PR gate must never go red because models.dev moved.
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&snapshot_path).expect("vendored snapshot exists"),
+        )
+        .expect("vendored snapshot parses");
+        let code = generate_catalog_data(&snapshot);
         if fs::read_to_string(&data_path).unwrap_or_default() != code {
-            eprintln!("crates/simllms/src/catalog_data.rs is out of date");
-            dirty = true;
-        }
-        if dirty {
+            eprintln!("crates/simllms/src/catalog_data.rs does not match the vendored snapshot; run `cargo xtask refresh-catalog`");
             std::process::exit(1);
         }
         println!("catalog is up to date");
         return;
     }
+
+    let snapshot = fetch_snapshot();
+    let snapshot_json = serde_json::to_string_pretty(&snapshot).expect("snapshot serializes");
+    let code = generate_catalog_data(&snapshot);
 
     if let Some(dir) = snapshot_path.parent() {
         fs::create_dir_all(dir).expect("create catalog dir");
