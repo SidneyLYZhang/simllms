@@ -129,6 +129,24 @@ impl Client {
         self
     }
 
+    /// Selects a DashScope region (or workspace domain) instead of the
+    /// shared Beijing host. See `DashScopeRegion` for the key-region
+    /// binding constraint — a raw `with_base_url` override bypasses this
+    /// deliberately and is not checked.
+    pub fn with_dashscope_region(mut self, region: crate::provider::DashScopeRegion) -> Self {
+        debug_assert_eq!(self.provider, Provider::DashScope);
+        self.base_url = Some(region.base_url());
+        self
+    }
+
+    /// Selects Zhipu's international host (`api.z.ai`) instead of the CN
+    /// default (`open.bigmodel.cn`). Keys are issued per site.
+    pub fn with_zhipu_international(mut self) -> Self {
+        debug_assert_eq!(self.provider, Provider::Zhipu);
+        self.base_url = Some("https://api.z.ai/api/paas/v4".into());
+        self
+    }
+
     pub fn with_options(mut self, options: Options) -> Self {
         self.options = options;
         self
@@ -206,7 +224,12 @@ impl Client {
 
         let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
         let url = self.url();
-        let request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
+        let mut request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
+        // Qwen's streaming endpoints require an explicit SSE opt-in header;
+        // harmless on compatible-mode, required on native mode.
+        if self.provider == Provider::DashScope {
+            request = request.header("X-DashScope-SSE", "enable");
+        }
         let response = request
             .send()
             .await
@@ -832,5 +855,93 @@ mod tests {
         };
         assert!(matches!(err, Error::Config(_)));
         assert!(err.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn dashscope_chat_uses_bearer_and_compatible_path() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer sk-dash")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "model": "qwen-plus" })))
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::DashScope, "qwen-plus", "sk-dash")
+            .with_base_url(server.url());
+        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn dashscope_streaming_sends_the_sse_header() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .match_header("X-DashScope-SSE", "enable")
+            .with_body(sse_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::DashScope, "qwen-plus", "sk-dash")
+            .with_base_url(server.url());
+        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let chunk = stream.next().await.expect("first chunk").expect("chunk ok");
+        assert!(chunk.delta.is_some());
+    }
+
+    #[test]
+    fn dashscope_region_shapes_endpoints() {
+        use crate::provider::DashScopeRegion;
+        assert_eq!(
+            DashScopeRegion::Cn.base_url(),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(
+            DashScopeRegion::Singapore.base_url(),
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(
+            DashScopeRegion::Workspace {
+                id: "llm-xxx".into(),
+                region: crate::provider::DASHSCOPE_CN_BEIJING,
+            }
+            .base_url(),
+            "https://llm-xxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        );
+
+        let client = Client::new(Provider::DashScope, "qwen-plus", "sk")
+            .with_dashscope_region(DashScopeRegion::Workspace {
+                id: "llm-xxx".into(),
+                region: crate::provider::DASHSCOPE_AP_SOUTHEAST_1,
+            });
+        assert_eq!(
+            client.url(),
+            "https://llm-xxx.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn zhipu_chat_on_cn_default() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer sk-glm")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "model": "glm-5.3" })))
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::Zhipu, "glm-5.3", "sk-glm")
+            .with_base_url(server.url());
+        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn zhipu_international_host_selectable() {
+        let client = Client::new(Provider::Zhipu, "glm-5.3", "sk").with_zhipu_international();
+        assert_eq!(client.url(), "https://api.z.ai/api/paas/v4/chat/completions");
+        // CN remains the default.
+        let client = Client::new(Provider::Zhipu, "glm-5.3", "sk");
+        assert_eq!(client.url(), "https://open.bigmodel.cn/api/paas/v4/chat/completions");
     }
 }
