@@ -190,12 +190,12 @@ mod tests {
             &ResolvedCapabilities::Known(caps),
             &text_request(),
             Provider::DeepSeek,
-            "deepseek-chat",
+            "deepseek-v4-flash",
         )
         .expect("deprecated id must warn, not refuse");
         assert_eq!(
             outcome.warnings,
-            vec![Warning::DeprecatedModel { model: "deepseek-chat".into() }]
+            vec![Warning::DeprecatedModel { model: "deepseek-v4-flash".into() }]
         );
     }
 

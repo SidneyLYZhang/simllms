@@ -35,7 +35,7 @@ const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn default_catalog() -> &'static Catalog {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(Catalog::placeholder)
+    CATALOG.get_or_init(Catalog::builtin)
 }
 
 /// One provider, one Model Id, one credential. Construct it, then Chat.

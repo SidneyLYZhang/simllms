@@ -1,10 +1,11 @@
 use crate::capabilities::{Capabilities, ResolvedCapabilities, Source};
 use crate::provider::Provider;
+use crate::{catalog_data};
 use std::collections::HashMap;
 
-/// The built-in table of Models and their Capabilities. This ticket ships a
-/// hand-written placeholder; the vendored models.dev snapshot and codegen
-/// replace it without changing this interface.
+/// The built-in table of Models and their Capabilities, generated from the
+/// vendored models.dev snapshot plus hand-maintained image-generation
+/// overrides.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     entries: HashMap<(Provider, String), Capabilities>,
@@ -22,38 +23,136 @@ impl Catalog {
         self.entries.insert((provider, model.into()), caps);
     }
 
-    /// Hand-written entries standing in for the real snapshot. Values are
-    /// conservative and exist to make Gate behaviour testable.
-    pub fn placeholder() -> Self {
+    pub fn snapshot_commit(&self) -> &'static str {
+        catalog_data::SNAPSHOT_COMMIT
+    }
+
+    /// The catalog a Client uses unless told otherwise: codegen'd models.dev
+    /// entries overlaid with the hand-maintained image-generation models.
+    pub fn builtin() -> Self {
         let mut cat = Catalog::default();
-        use crate::capabilities::{Modality, ModelStatus, ReasoningMode};
-        use std::collections::BTreeSet;
-
-        let mut deepseek_pro = Capabilities::text_only(Source::Catalog);
-        deepseek_pro.structured_output = true;
-        deepseek_pro.tool_call = true;
-        deepseek_pro.reasoning = ReasoningMode::Toggle;
-        deepseek_pro.max_output_tokens = Some(8192);
-        cat.insert(Provider::DeepSeek, "deepseek-v4-pro", deepseek_pro);
-
-        let deepseek_chat = Capabilities::text_only(Source::Catalog);
-        cat.insert(Provider::DeepSeek, "deepseek-chat", Capabilities {
-            status: ModelStatus::Deprecated,
-            ..deepseek_chat
-        });
-
-        let mut kimi = Capabilities::text_only(Source::Catalog);
-        kimi.input_modalities = BTreeSet::from([Modality::Text, Modality::Image]);
-        kimi.reasoning = ReasoningMode::Effort {
-            levels: BTreeSet::from(["low".into(), "high".into(), "max".into()]),
-        };
-        cat.insert(Provider::Moonshot, "kimi-k3", kimi);
-
-        let mut glm = Capabilities::text_only(Source::Catalog);
-        glm.structured_output = true;
-        glm.reasoning = ReasoningMode::Toggle;
-        cat.insert(Provider::Zhipu, "glm-5.3", glm);
-
+        for (provider, model, caps) in catalog_data::entries() {
+            cat.insert(provider, model, caps);
+        }
+        for (provider, model, caps) in image_generation_overrides() {
+            cat.insert(provider, model, caps);
+        }
         cat
+    }
+}
+
+/// Hand-maintained: models.dev is chat-only here and no provider's
+/// /v1/models covers text-to-image, so these entries are curated by hand
+/// and deliberately minimal — image generation only, no chat Capabilities
+/// claimed. Correctness of the ids is owned by the image-generation work.
+fn image_generation_overrides() -> Vec<(Provider, &'static str, Capabilities)> {
+    vec![
+        (
+            Provider::Zhipu,
+            "cogview-4",
+            Capabilities { image_generation: true, ..Capabilities::text_only(Source::Catalog) },
+        ),
+        (
+            Provider::DashScope,
+            "wanx2.1-t2i-turbo",
+            Capabilities { image_generation: true, ..Capabilities::text_only(Source::Catalog) },
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::Modality;
+    use crate::error::{Error, MissingCapability};
+    use crate::gate::{self, ChatRequest, Warning};
+    use crate::message::{ContentBlock, ImageSource, Message, Role};
+    use crate::options::Options;
+
+    fn builtin() -> Catalog {
+        Catalog::builtin()
+    }
+
+    fn image_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![Message::blocks(
+                Role::User,
+                vec![
+                    ContentBlock::Text("what is this?".into()),
+                    ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
+                ],
+            )],
+            options: Options::default(),
+            stream: false,
+        }
+    }
+
+    fn text_request() -> ChatRequest {
+        ChatRequest { messages: vec![Message::text("hello")], options: Options::default(), stream: false }
+    }
+
+    #[test]
+    fn real_entries_resolve_with_catalog_source() {
+        let cat = builtin();
+        match cat.resolve(Provider::DeepSeek, "deepseek-v4-pro") {
+            ResolvedCapabilities::Known(c) => {
+                assert_eq!(c.source, Source::Catalog);
+                assert!(c.structured_output);
+                assert!(c.context_window.is_some());
+            }
+            ResolvedCapabilities::Unknown => panic!("deepseek-v4-pro must be in the snapshot"),
+        }
+    }
+
+    #[test]
+    fn gate_refuses_images_for_text_only_models_on_real_entries() {
+        let cat = builtin();
+        let resolved = cat.resolve(Provider::DeepSeek, "deepseek-v4-pro");
+        let err = gate::gate(&resolved, &image_request(), Provider::DeepSeek, "deepseek-v4-pro")
+            .expect_err("deepseek-v4-pro is text-only");
+        match err {
+            Error::Capability(e) => assert_eq!(e.missing, MissingCapability::ImageInput),
+            other => panic!("expected Capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_passes_images_for_vision_models_on_real_entries() {
+        let cat = builtin();
+        let resolved = cat.resolve(Provider::Moonshot, "kimi-k3");
+        let outcome = gate::gate(&resolved, &image_request(), Provider::Moonshot, "kimi-k3")
+            .expect("kimi-k3 accepts image input");
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn gate_warns_on_real_deprecated_ids() {
+        let cat = builtin();
+        // deepseek-v4-flash is marked deprecated in the snapshot.
+        let resolved = cat.resolve(Provider::DeepSeek, "deepseek-v4-flash");
+        let outcome = gate::gate(&resolved, &text_request(), Provider::DeepSeek, "deepseek-v4-flash")
+            .expect("deprecated warns, never refuses");
+        assert_eq!(outcome.warnings, vec![Warning::DeprecatedModel { model: "deepseek-v4-flash".into() }]);
+    }
+
+    #[test]
+    fn unknown_ids_still_warn_and_pass() {
+        let cat = builtin();
+        let resolved = cat.resolve(Provider::OpenRouter, "some/new-model");
+        let outcome = gate::gate(&resolved, &image_request(), Provider::OpenRouter, "some/new-model")
+            .expect("catalog miss must warn-and-pass");
+        assert!(matches!(outcome.warnings.as_slice(), [Warning::UnknownModel { .. }]));
+    }
+
+    #[test]
+    fn image_generation_models_are_hand_maintained() {
+        let cat = builtin();
+        match cat.resolve(Provider::Zhipu, "cogview-4") {
+            ResolvedCapabilities::Known(c) => {
+                assert!(c.image_generation);
+                assert!(!c.input_modalities.contains(&Modality::Image));
+            }
+            ResolvedCapabilities::Unknown => panic!("hand-maintained override must be present"),
+        }
     }
 }

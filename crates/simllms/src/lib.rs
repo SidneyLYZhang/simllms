@@ -6,6 +6,7 @@
 
 pub mod capabilities;
 pub mod catalog;
+pub mod catalog_data;
 pub mod client;
 pub mod dialect;
 pub mod error;
