@@ -21,3 +21,18 @@ impl std::fmt::Display for Provider {
         f.write_str(name)
     }
 }
+
+/// The provider's documented OpenAI-compatible root. A Client may always
+/// override this with its own `base_url`.
+impl Provider {
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "https://api.deepseek.com",
+            Provider::Moonshot => "https://api.moonshot.cn",
+            Provider::DashScope => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Provider::Zhipu => "https://open.bigmodel.cn/api/paas/v4",
+            Provider::MiMo => "https://api.xiaomimimo.com",
+            Provider::OpenRouter => "https://openrouter.ai/api/v1",
+        }
+    }
+}

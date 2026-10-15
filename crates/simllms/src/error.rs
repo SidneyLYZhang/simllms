@@ -59,8 +59,38 @@ pub enum Error {
 
 impl Error {
     /// Capability and Config are local: they never reach the network and are
-    /// never retried. Api and Transport may be.
+    /// never retried. Api is retryable only for 429/5xx — a 4xx is the
+    /// provider saying no, permanently. Transport failures may be retried.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::Api(_) | Error::Transport(_))
+        match self {
+            Error::Api(e) => e.status == 429 || e.status >= 500,
+            Error::Transport(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(status: u16) -> Error {
+        Error::Api(ApiError { status, provider_message: String::new(), raw_body: String::new() })
+    }
+
+    #[test]
+    fn retryability_follows_the_status() {
+        assert!(api(429).is_retryable());
+        assert!(api(500).is_retryable());
+        assert!(api(503).is_retryable());
+        assert!(!api(400).is_retryable());
+        assert!(!api(401).is_retryable());
+        assert!(!api(404).is_retryable());
+        assert!(Error::Transport(TransportError { message: "x".into() }).is_retryable());
+        assert!(!Error::Capability(CapabilityError {
+            model: "m".into(),
+            missing: MissingCapability::ImageInput,
+        })
+        .is_retryable());
     }
 }
