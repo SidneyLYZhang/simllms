@@ -1,5 +1,7 @@
 [build-system]
-requires = ["maturin>=1.7,<2"]
+# 1.9.3 is the first release that carries PEP 639 license files into a source
+# distribution, which is what the two settings below ask for.
+requires = ["maturin>=1.9.3,<2"]
 build-backend = "maturin"
 
 [project]
@@ -9,7 +11,29 @@ name = "simllms"
 dynamic = ["version"]
 description = "Unified client for multiple LLM providers"
 requires-python = ">=3.10"
-license = { text = "MIT OR Apache-2.0" }
+# PEP 639: an SPDX expression for the license, and the files themselves listed
+# so they reach an installed distribution under `*.dist-info/licenses/`. The
+# deprecated `license = { text = … }` table carried the words and nothing else.
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT", "THIRD-PARTY-NOTICES.md"]
+# Registry pages render this file; the repository's default README is Chinese.
+readme = "README.en.md"
+# PyPI has no keyword ceiling, so this side names every provider; the crate is
+# capped at five and picks the ones people search for.
+keywords = [
+    "llm",
+    "openai-compatible",
+    "deepseek",
+    "moonshot",
+    "kimi",
+    "qwen",
+    "dashscope",
+    "zhipu",
+    "glm",
+    "xiaomi",
+    "mimo",
+    "openrouter",
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -24,3 +48,17 @@ classifiers = [
 python-source = "python"
 module-name = "simllms._core"
 bindings = "pyo3"
+# The wheel is told about the licenses through `license-files` and about the
+# README through `readme`, so only the source distribution needs them listed as
+# files. Each path is a copy that `cargo xtask sync-package` writes: PEP 639
+# forbids `..` here, so a root-level file cannot travel by reference.
+include = [
+    { path = "CHANGELOG.md", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "README.en.md", format = "sdist" },
+    { path = "THIRD-PARTY-NOTICES.md", format = "sdist" },
+]
+# Byte-compiled files from whoever built the wheel have no business travelling
+# inside it; the wheel is the installed package, not a working directory.
+exclude = ["**/__pycache__/**", "**/*.pyc"]

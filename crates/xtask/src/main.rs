@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 mod docs;
+mod manifest;
+mod package;
 mod version;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -34,10 +37,16 @@ fn main() {
             let check = std::env::args().nth(2).as_deref() == Some("--check");
             sync_version(check);
         }
+        Some("sync-package") => {
+            let check = std::env::args().nth(2).as_deref() == Some("--check");
+            sync_package(check);
+        }
+        Some("check-package") => check_package(std::env::args().skip(2)),
         Some("check-docs") => check_docs(),
         _ => {
             eprintln!(
-                "usage: cargo xtask refresh-catalog [--check] | sync-version [--check] | check-docs"
+                "usage: cargo xtask refresh-catalog [--check] | sync-version [--check] | \
+                 sync-package [--check] | check-package [--crate-listing <file|->] | check-docs"
             );
             std::process::exit(2);
         }
@@ -51,26 +60,87 @@ fn check_docs() {
     let bindings = read(&path(docs::BINDINGS));
     let guide = read(&path(docs::GUIDE));
 
-    let problems = docs::check(&core, &bindings, &guide);
-    if problems.is_empty() {
-        println!("the guide's Rust-only list matches the code");
-        return;
+    finish(
+        docs::check(&core, &bindings, &guide),
+        "the guide's Rust-only list matches the code",
+    );
+}
+
+/// The files a published package has to carry live at the repository root, so
+/// each package keeps a derived copy of them. A write run rewrites the copies;
+/// `--check` only judges them, the same split `sync-version` uses.
+fn sync_package(check: bool) {
+    if !check {
+        for (root, dest) in package::copy_pairs() {
+            let source = read(&path(root));
+            if read_copy(&path(&dest)).as_deref() != Some(source.as_str()) {
+                fs::write(path(&dest), source).unwrap_or_else(|e| panic!("write {dest}: {e}"));
+                println!("{dest} rewritten from the repository-root {root}");
+            }
+        }
     }
-    for problem in &problems {
-        eprintln!("{problem}");
+    finish(copy_problems(), "the packages' copies match the root files");
+}
+
+/// Both manifests and both sets of copies, plus the contents of a packed crate
+/// when one is offered: `cargo package --list | cargo xtask check-package`.
+fn check_package(args: impl Iterator<Item = String>) {
+    let args: Vec<String> = args.collect();
+    let mut problems = copy_problems();
+    problems.extend(manifest_problems());
+    if let Some(index) = args.iter().position(|arg| arg == "--crate-listing") {
+        let listing = read_listing(args.get(index + 1).map(String::as_str));
+        let manifest = read(&path(package::CRATE_MANIFEST));
+        problems.extend(package::check_crate_listing(&listing, &manifest));
     }
-    std::process::exit(1);
+    finish(
+        problems,
+        "packages carry their licenses, attribution and README",
+    );
+}
+
+/// The derived copies, judged against the files at the repository root.
+fn copy_problems() -> Vec<String> {
+    let copies: Vec<(String, String, String, Option<String>)> = package::copy_pairs()
+        .into_iter()
+        .map(|(root, dest)| {
+            let source = read(&path(root));
+            let copy = read_copy(&path(&dest));
+            (root.to_string(), dest, source, copy)
+        })
+        .collect();
+    let reads: Vec<package::CopyRead<'_>> = copies
+        .iter()
+        .map(|(root, dest, source, copy)| package::CopyRead {
+            root,
+            dest,
+            root_text: source,
+            copy_text: copy.as_deref(),
+        })
+        .collect();
+    package::copy_problems(&reads)
+}
+
+/// What the two manifests declare about themselves, and where they disagree.
+fn manifest_problems() -> Vec<String> {
+    let root_manifest = read(&path(version::ROOT_MANIFEST));
+    let crate_manifest = read(&path(package::CRATE_MANIFEST));
+    let pyproject = read(&path(package::PYPROJECT));
+    let mut problems = package::check_crate_manifest(&crate_manifest, &root_manifest);
+    problems.extend(package::check_pyproject(&pyproject));
+    problems.extend(package::check_agreement(&crate_manifest, &pyproject));
+    problems
 }
 
 /// The Authoritative Version lives in the root workspace manifest; the binding
 /// crate is its only written copy. Nothing here reads a tag or rewrites the
 /// repository's own declaration — a human changes the source and the diff shows it.
 fn sync_version(check: bool) {
-    let binding_path = path(version::BINDING_MANIFEST);
+    let binding_path = path(package::BINDING_MANIFEST);
     let root_manifest = read(&path(version::ROOT_MANIFEST));
     let binding_manifest = read(&binding_path);
-    let pyproject = read(&path(version::PYPROJECT));
-    let python_init = read(&path(version::PYTHON_INIT));
+    let pyproject = read(&path(package::PYPROJECT));
+    let python_init = read(&path(package::PYTHON_INIT));
 
     // A version we cannot read must not be propagated; `inspect` below is what
     // names why, so dropping it here defers the report rather than swallowing it.
@@ -85,7 +155,7 @@ fn sync_version(check: bool) {
             fs::write(&binding_path, &rendered).expect("write the binding crate's manifest");
             println!(
                 "derived {} from the Authoritative Version",
-                version::BINDING_MANIFEST
+                package::BINDING_MANIFEST
             );
             rendered
         }
@@ -93,14 +163,33 @@ fn sync_version(check: bool) {
     };
 
     let problems = version::inspect(&root_manifest, &effective, &pyproject, &python_init);
-    if problems.is_empty() {
-        println!("versions are consistent");
-        return;
+    finish(problems, "versions are consistent");
+}
+
+/// Name every problem and fail, or say the one line that nothing is wrong.
+fn finish(problems: Vec<String>, success: &str) {
+    if !problems.is_empty() {
+        for problem in &problems {
+            eprintln!("{problem}");
+        }
+        std::process::exit(1);
     }
-    for problem in &problems {
-        eprintln!("{problem}");
+    println!("{success}");
+}
+
+/// `--crate-listing -` takes `cargo package --list` output from a pipe, so the
+/// contents of an archive get checked without anyone reading a `tar` listing.
+fn read_listing(source: Option<&str>) -> String {
+    match source.unwrap_or("-") {
+        "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .expect("read the crate listing from stdin");
+            buf
+        }
+        file => read(&PathBuf::from(file)),
     }
-    std::process::exit(1);
 }
 
 fn path(relative: &str) -> PathBuf {
@@ -108,8 +197,22 @@ fn path(relative: &str) -> PathBuf {
 }
 
 fn read(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {} (run from the repository root): {e}", path.display()))
+    fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "read {} (run from the repository root): {e}",
+            path.display()
+        )
+    })
+}
+
+/// A copy that is not there yet is a finding, not a crash; any other failure to
+/// read it is a broken checkout and says so.
+fn read_copy(path: &Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read {}: {e}", path.display()),
+    }
 }
 
 fn refresh_catalog(check: bool) {

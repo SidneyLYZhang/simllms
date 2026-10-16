@@ -55,9 +55,7 @@ async fn main() {
                 .await
                 .expect("mock image generation failed");
             mock.assert();
-            println!(
-                "(against the local mock server — set ZHIPU_API_KEY to go live)"
-            );
+            println!("(against the local mock server — set ZHIPU_API_KEY to go live)");
             show(&reply);
         }
     }

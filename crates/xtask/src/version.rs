@@ -3,18 +3,21 @@
 //! binding crate's manifest is the only copy we write, because ADR-0001 keeps
 //! it outside the root workspace and it therefore cannot inherit.
 
-/// The layout this check knows: one source plus its derived copies. Naming the
-/// file in every problem is what makes a red gate actionable.
+use crate::manifest::{array_in_section, quoted_in_section, replace_quoted_in_section, value_of};
+use crate::package::{BINDING_MANIFEST, PYPROJECT, PYTHON_INIT};
+
+/// Where the Authoritative Version lives. Naming the file in every problem is
+/// what makes a red gate actionable.
 pub const ROOT_MANIFEST: &str = "Cargo.toml";
-pub const BINDING_MANIFEST: &str = "crates/simllms-python/Cargo.toml";
-pub const PYPROJECT: &str = "crates/simllms-python/pyproject.toml";
-pub const PYTHON_INIT: &str = "crates/simllms-python/python/simllms/__init__.py";
 
 /// Validate the shape of a version we are about to propagate.
 fn validate(version: &str) -> Result<(), String> {
     let core_and_extra = version.split_once(['-', '+']).map_or(version, |v| v.0);
     let parts: Vec<&str> = core_and_extra.split('.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
     {
         return Err(format!(
             "`{version}` is not a `major.minor.patch` version — the Authoritative Version \
@@ -26,14 +29,13 @@ fn validate(version: &str) -> Result<(), String> {
 
 /// Read `[workspace.package] version` out of the root manifest.
 pub fn authoritative_version(root_manifest: &str) -> Result<String, String> {
-    let found = quoted_in_section(root_manifest, "[workspace.package]", "version").ok_or_else(
-        || {
+    let found =
+        quoted_in_section(root_manifest, "[workspace.package]", "version").ok_or_else(|| {
             format!(
                 "{ROOT_MANIFEST} has no `[workspace.package] version` — that line is the \
                  Authoritative Version and everything else derives from it"
             )
-        },
-    )?;
+        })?;
     validate(&found)?;
     Ok(found)
 }
@@ -98,7 +100,7 @@ pub fn inspect(
         ));
     }
 
-    if let Some(line) = assignment_of(python_init, "__version__") {
+    if let Some(line) = value_of(python_init, "__version__") {
         if line.contains('"') || line.contains('\'') {
             problems.push(format!(
                 "{PYTHON_INIT} holds its own version literal — the reported version must come \
@@ -115,116 +117,13 @@ pub fn inspect(
     problems
 }
 
-fn quoted_in_section(text: &str, section: &str, key: &str) -> Option<String> {
-    let mut in_section = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = trimmed == section;
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        if let Some(rest) = stripped_key(trimmed, key) {
-            return unquoted(rest);
-        }
-    }
-    None
-}
-
-fn replace_quoted_in_section(text: &str, section: &str, key: &str, value: &str) -> String {
-    let mut in_section = false;
-    let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = trimmed == section;
-            out.push_str(line);
-            continue;
-        }
-        if in_section && stripped_key(trimmed, key).is_some() {
-            out.push_str(&format!("{key} = \"{value}\"\n"));
-            in_section = false;
-            continue;
-        }
-        out.push_str(line);
-    }
-    out
-}
-
-fn array_in_section(text: &str, section: &str, key: &str) -> Vec<String> {
-    let raw = match quoted_line_value(text, section, key) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .filter_map(|item| match unquoted(item.trim()) {
-            Some(s) if !s.is_empty() => Some(s),
-            _ => None,
-        })
-        .collect()
-}
-
-fn quoted_line_value(text: &str, section: &str, key: &str) -> Option<String> {
-    let mut in_section = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = trimmed == section;
-            continue;
-        }
-        if in_section {
-            if let Some(rest) = stripped_key(trimmed, key) {
-                return Some(rest.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn assignment_of<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-    text.lines().find_map(|line| {
-        let trimmed = line.trim();
-        stripped_key(trimmed, name).map(|rest| rest.trim_start_matches('=').trim())
-    })
-}
-
-/// `key = <rest>` inside a line, ignoring comments and `key_other`.
-fn stripped_key<'a>(trimmed: &'a str, key: &str) -> Option<&'a str> {
-    let rest = trimmed.strip_prefix(key)?;
-    let rest = rest.trim_start();
-    if !rest.starts_with('=') {
-        return None;
-    }
-    let rest = rest.trim_start_matches('=').trim();
-    if rest.is_empty() || rest.starts_with('#') {
-        return None;
-    }
-    Some(rest)
-}
-
-fn unquoted(value: &str) -> Option<String> {
-    let value = value.split('#').next().unwrap_or("").trim();
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        return Some(value[1..value.len() - 1].to_string());
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ROOT: &str = "[workspace]\nmembers = [\"crates/simllms\"]\n\n[workspace.package]\nversion = \"0.1.0\"\nlicense = \"MIT OR Apache-2.0\"\n";
     const BINDING: &str = "[package]\nname = \"simllms-python\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n";
-    const PYPROJECT: &str = "[build-system]\nrequires = [\"maturin>=1.7,<2\"]\n\n[project]\nname = \"simllms\"\ndynamic = [\"version\"]\nrequires-python = \">=3.10\"\n";
+    const PYPROJECT_BODY: &str = "[build-system]\nrequires = [\"maturin>=1.7,<2\"]\n\n[project]\nname = \"simllms\"\ndynamic = [\"version\"]\nrequires-python = \">=3.10\"\n";
     const INIT: &str = "from simllms import _core\n\n__version__ = _core.__version__\n\nLOGGER_NAME = \"simllms\"\n";
 
     fn with_binding_version(version: &str) -> String {
@@ -274,15 +173,21 @@ mod tests {
 
     #[test]
     fn a_consistent_tree_reports_no_problems() {
-        assert_eq!(inspect(ROOT, BINDING, PYPROJECT, INIT), Vec::<String>::new());
+        assert_eq!(
+            inspect(ROOT, BINDING, PYPROJECT_BODY, INIT),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn a_stale_derived_copy_is_named() {
-        let problems = inspect(ROOT, &with_binding_version("0.0.9"), PYPROJECT, INIT);
+        let problems = inspect(ROOT, &with_binding_version("0.0.9"), PYPROJECT_BODY, INIT);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("0.0.9") && problems[0].contains("0.1.0"));
-        assert!(problems[0].contains("sync-version"), "must say how to fix it");
+        assert!(
+            problems[0].contains("sync-version"),
+            "must say how to fix it"
+        );
     }
 
     #[test]
@@ -290,7 +195,7 @@ mod tests {
         let root = ROOT.replace("0.1.0", "0.2.0-rc.1");
         let binding = with_binding_version("0.2.0-rc.1");
         assert_eq!(
-            inspect(&root, &binding, PYPROJECT, INIT),
+            inspect(&root, &binding, PYPROJECT_BODY, INIT),
             Vec::<String>::new(),
             "refusing an rc tag belongs to the release line, not to this check"
         );
@@ -298,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_static_python_version_is_a_problem() {
-        let pyproject = PYPROJECT.replace("dynamic = [\"version\"]", "version = \"0.1.0\"");
+        let pyproject = PYPROJECT_BODY.replace("dynamic = [\"version\"]", "version = \"0.1.0\"");
         let problems = inspect(ROOT, BINDING, &pyproject, INIT);
         assert!(
             problems.iter().any(|p| p.contains("static")),
@@ -312,31 +217,36 @@ mod tests {
 
     #[test]
     fn a_dynamic_list_without_version_is_a_problem() {
-        let pyproject = PYPROJECT.replace("dynamic = [\"version\"]", "dynamic = [\"readme\"]");
+        let pyproject = PYPROJECT_BODY.replace("dynamic = [\"version\"]", "dynamic = [\"readme\"]");
         let problems = inspect(ROOT, BINDING, &pyproject, INIT);
-        assert!(problems.iter().any(|p| p.contains("dynamic")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("dynamic")),
+            "{problems:?}"
+        );
     }
 
     #[test]
     fn a_version_literal_in_the_python_layer_is_a_problem() {
         let init = INIT.replace("__version__ = _core.__version__", "__version__ = \"0.1.0\"");
-        let problems = inspect(ROOT, BINDING, PYPROJECT, &init);
+        let problems = inspect(ROOT, BINDING, PYPROJECT_BODY, &init);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("_core.__version__"), "{problems:?}");
     }
 
     #[test]
     fn a_missing_python_version_report_is_a_problem() {
-        let problems = inspect(ROOT, BINDING, PYPROJECT, "LOGGER_NAME = \"simllms\"\n");
+        let problems = inspect(ROOT, BINDING, PYPROJECT_BODY, "LOGGER_NAME = \"simllms\"\n");
         assert!(
-            problems.iter().any(|p| p.contains("no longer reports a version")),
+            problems
+                .iter()
+                .any(|p| p.contains("no longer reports a version")),
             "{problems:?}"
         );
     }
 
     #[test]
     fn comments_do_not_count_as_a_static_version() {
-        let pyproject = format!("{PYPROJECT}\n# version = \"0.1.0\"\n");
+        let pyproject = format!("{PYPROJECT_BODY}\n# version = \"0.1.0\"\n");
         assert_eq!(
             inspect(ROOT, BINDING, &pyproject, INIT),
             Vec::<String>::new(),

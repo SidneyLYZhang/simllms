@@ -68,9 +68,7 @@ async fn main() {
                 }
             }
             mock.assert();
-            println!(
-                "{text} (against the local mock server — set MOONSHOT_API_KEY to go live)"
-            );
+            println!("{text} (against the local mock server — set MOONSHOT_API_KEY to go live)");
             println!("[total tokens] {usage:?}");
         }
     }

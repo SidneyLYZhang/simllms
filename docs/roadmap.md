@@ -18,7 +18,7 @@
 
 ### 代码整理发现的优化点
 
-1. **版本号三处硬编码**：workspace `Cargo.toml`、`pyproject.toml`、`python/simllms/__init__.py` 各写一份 `0.1.0`，发版时必漂移。spec 承诺「Rust 与 Python 版本 lockstep、单一版本源」，尚未兑现。
+1. ~~**版本号三处硬编码**~~ **已解决（#18）**：根 workspace `Cargo.toml` 的 `[workspace.package] version` 是唯一权威源（词汇表：**Authoritative Version**），派生副本只剩 Python 绑定 crate 的 manifest 一处——ADR-0001 把它留在根 workspace 之外，继承不到；`pyproject.toml` 改 `dynamic`，`__version__` 由编译期注入。`cargo xtask sync-version --check` 已在 CI。#19 又新增一批派生副本（各包目录自带的 README / 两份 License / THIRD-PARTY-NOTICES / CHANGELOG，因为 cargo 与 maturin 都不允许 `include` 指向包目录之上），由同一族的 `sync-package` / `check-package` 守住字节一致。
 2. **Python 侧配置面缺口（实测，2026-10-16）**：`capability_overrides` 在 Python **一直可用**（绑定层会解析并在未知键上报 `TypeError`），spec user story 9 并不缺失。真正未绑定的是核心 Client 的 8 个配置入口——自定义 `Auth` 头、DashScope 区域、Zhipu 国际端点、default headers、重试策略、流式超时、`refresh_models()`、以及未知 Model Id 的结构化**警告**可见性（ADR-0005）——对应 user story 13/24/26/27 与 8 的警告部分；另 `Catalog` / `Capabilities` / `Capability Source` 的只读视图与类型化覆盖也缺失（覆盖参数目前是裸 dict，静态检查看不到拼写与值类型错误）。issue #12 标题所称的 "Python parity" 范围比标题窄。
 3. **方言层缝隙未使用**：`dialect.rs` 目前是单一 OpenAI 兼容翻译，`_provider` 参数空置。这是为非 OpenAI 方言（Qwen 原生 DashScope、Zhipu 原生异步端点）预留的缝，暂不需要动，但新增能力（tool、file、audio）时应继续只在此层分叉。
 4. **测试缝窄**：spec 约定 dialect 翻译作为纯函数用 mockito 做线上层测试；后续每个新能力（tool loop、file 上传、audio）都应先补这层测试再实现。
@@ -41,6 +41,8 @@
 - Python 的能力面与 parity 缺口**不在 P0**：见 [#22](https://github.com/SidneyLYZhang/simllms/issues/22) 与整理发现点 2，走 0.2.0。P0 只负责在文档里把这批缺口如实说出来。
 
 **票与缝（已发布，2026-10-16）**：spec [#16](https://github.com/SidneyLYZhang/simllms/issues/16) 之下五张垂直票，原生阻塞边已接——[#17](https://github.com/SidneyLYZhang/simllms/issues/17) 文档说出 Rust-only 清单、[#18](https://github.com/SidneyLYZhang/simllms/issues/18) 版本单一来源（17/18 可并行）→ [#19](https://github.com/SidneyLYZhang/simllms/issues/19) 产物自述 → [#20](https://github.com/SidneyLYZhang/simllms/issues/20) 全链 dry-run → [#21](https://github.com/SidneyLYZhang/simllms/issues/21) 真发布 + runbook + ADR-0006/0007。三个测试缝：**S1 发布产物**（唯一主缝，dry-run/真发布/本地共用）、**S2 xtask 的纯函数 `--check` 家族**、**S3 配置自述一致性**（挡「改了 environment 名 → 发布 403」与文档漂移）。现有两缝（Gate 合法性、方言翻译）不动。
+
+**P0 进度（2026-10-16）**：#17 / #18 / #19 已落地。#19 给两份 manifest 各加了显式 `include` 白名单，Python 侧换成 SPDX 表达式 `MIT OR Apache-2.0` + `license-files`（PEP 639，wheel 里落在 `*.dist-info/licenses/`），描述保持一句 provider 无关的话，关键词带上各家 provider 名与 `openai-compatible`；registry 页面渲染的是 `README.en.md`，仓库默认 README（中文）不动。同一件事由两条缝分别证明：S2 的 `cargo xtask check-package` 读 manifest，S1 的 `tests/test_package_inventory.py` 拆真实的 `.crate` / wheel / sdist 看里面到底有什么。注意一个平台硬约束：crates.io 只收 5 个关键词，所以 crate 侧放 `llm` + `openai-compatible` + 三家 provider，PyPI 侧放全 12 个，`check-package` 要求前者是后者的子集。下一张是 #20。
 
 **版本语义**：新增公共 API 走 minor（0.2.0），patch 只留给修复；`1.0.0` 的门槛绑 P1（tool calling 落地 = 请求/响应形状不再变）。
 

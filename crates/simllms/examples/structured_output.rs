@@ -24,7 +24,9 @@ async fn main() {
             let client = Client::new(Provider::OpenRouter, "openai/gpt-4o-mini", key);
             let reply = client
                 .chat_with(
-                    vec![Message::text("法国的首都是哪座城市？人口约多少？返回 JSON。")],
+                    vec![Message::text(
+                        "法国的首都是哪座城市？人口约多少？返回 JSON。",
+                    )],
                     Options {
                         response_schema: Some(schema),
                         ..Default::default()

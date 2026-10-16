@@ -6,6 +6,25 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# crates.io renders one file, and the repository's default README is the Chinese
+# one, so the English copy is what a registry page shows.
+readme = "README.en.md"
+# Five keywords is crates.io's ceiling, and each is at most twenty characters, so
+# this side picks; PyPI has no cap and names every provider in pyproject.toml.
+keywords = ["llm", "openai-compatible", "deepseek", "moonshot", "qwen"]
+# A published crate states what it carries, so packing the wrong thing goes red
+# instead of letting extra files out. `include` cannot reach above the crate
+# directory, which is why the licenses, the attribution, the changelog and the
+# English README are copies that `cargo xtask sync-package` writes.
+include = [
+    "src",
+    "examples",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD-PARTY-NOTICES.md",
+]
 
 [dependencies]
 serde_json = { workspace = true }

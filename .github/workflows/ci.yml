@@ -25,6 +25,13 @@ jobs:
         run: cargo xtask refresh-catalog --check
       - name: Authoritative Version is derived everywhere
         run: cargo xtask sync-version --check
+      - name: Packed crate carries exactly what its manifest promises
+        # Without stdin this checks the derived package copies and both
+        # manifests; piping the listing also proves the archive's inventory,
+        # which is the thing crates.io would render badly.
+        run: |
+          cargo package --list --offline --allow-dirty -p simllms \
+            | cargo xtask check-package --crate-listing -
       - name: Rust-only entry-point list matches the bindings
         # The guide's list is derived from client.rs minus lib.rs, so binding a
         # method without editing the guide, or renaming one, goes red here.
@@ -44,10 +51,25 @@ jobs:
         working-directory: crates/simllms-python
         run: |
           uv venv
-          uv pip install -e . pytest mypy
+          uv pip install -e . pytest mypy maturin
+      - name: Pack the crate
+        run: cargo package --no-verify --allow-dirty -p simllms
+      - name: Build the wheel and sdist
+        working-directory: crates/simllms-python
+        run: |
+          uv run --no-sync maturin build --out target/artifacts
+          uv run --no-sync maturin sdist --out target/artifacts
+      - name: Name the artifacts for the inventory checks
+        # An unset variable lets those checks skip, and a green run that skipped
+        # is not proof of anything. `realpath` fails on a glob that matched
+        # nothing, so a drifted output path goes red here instead.
+        run: |
+          echo "SIMLLMS_CRATE=$(realpath target/package/simllms-*.crate)" >> "$GITHUB_ENV"
+          echo "SIMLLMS_WHEEL=$(realpath crates/simllms-python/target/artifacts/*.whl)" >> "$GITHUB_ENV"
+          echo "SIMLLMS_SDIST=$(realpath crates/simllms-python/target/artifacts/simllms-*.tar.gz)" >> "$GITHUB_ENV"
       - name: pytest
         working-directory: crates/simllms-python
         run: uv run --no-sync pytest tests
       - name: mypy (pure-Python layer)
         working-directory: crates/simllms-python
-        run: uv run --no-sync mypy python/simllms tests/test_client.py
+        run: uv run --no-sync mypy python/simllms tests/test_client.py tests/test_package_inventory.py

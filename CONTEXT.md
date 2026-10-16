@@ -88,6 +88,10 @@ _Avoid_: Publish, deploy, ship
 The single place that decides a Release's number — the workspace version in the root `Cargo.toml`. Every other version in the tree is a derived copy.
 _Avoid_: Master version, canonical version
 
+**Registry**:
+The public index a Release is made available on: crates.io for the crate, PyPI for the Python distribution. It is outside the package, unlike a Catalog Snapshot, which travels inside it.
+_Avoid_: Catalog, marketplace
+
 **Forward Fix**:
 Repairing a half-failed Release by cutting the next number, not by removing what already shipped. Registries keep old numbers forever; we do not undo them.
 _Avoid_: Rollback, yank

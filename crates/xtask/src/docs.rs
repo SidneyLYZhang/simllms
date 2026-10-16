@@ -117,8 +117,7 @@ fn fn_name(trimmed: &str) -> Option<String> {
     let rest = trimmed
         .strip_prefix("pub fn ")
         .or_else(|| trimmed.strip_prefix("pub async fn "))?;
-    rest
-        .split(['(', '<', ' '])
+    rest.split(['(', '<', ' '])
         .next()
         .filter(|name| !name.is_empty())
         .map(str::to_string)
@@ -131,17 +130,14 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
 
 fn backticked(text: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let mut pieces = text.split('`');
     // Odd-indexed pieces sit between a matched pair of backticks.
-    let mut index = 0usize;
-    while let Some(piece) = pieces.next() {
+    for (index, piece) in text.split('`').enumerate() {
         if index % 2 == 1 {
             let name = piece.trim();
             if !name.is_empty() && identifiers(name).count() == 1 {
                 names.push(name.to_string());
             }
         }
-        index += 1;
     }
     names
 }
@@ -232,18 +228,16 @@ Trailing prose with `with_base_url` outside the block.
 
     #[test]
     fn docs_that_match_the_gap_pass() {
-        let guide = format!(
-            "\
+        let guide = "\
 <!-- rust-only-begin -->
 - `with_retry`
 - `with_stream_timeouts`
 - `refresh_models`
 - `warnings`
 <!-- rust-only-end -->
-"
-        );
+";
         assert_eq!(
-            check(CORE, &bindings_that_call(&["with_base_url"]), &guide),
+            check(CORE, &bindings_that_call(&["with_base_url"]), guide),
             Vec::<String>::new()
         );
     }
@@ -257,8 +251,14 @@ Trailing prose with `with_base_url` outside the block.
             problems.iter().any(|p| p.contains("with_stream_timeouts")),
             "{problems:?}"
         );
-        assert!(problems.iter().any(|p| p.contains("refresh_models")), "{problems:?}");
-        assert!(problems.iter().any(|p| p.contains("warnings")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("refresh_models")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("warnings")),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -266,7 +266,11 @@ Trailing prose with `with_base_url` outside the block.
         let guide = "<!-- rust-only-begin -->\n- `with_retry`\n<!-- rust-only-end -->\n";
         // `with_retry` is now bound too, yet the guide still lists it; and the
         // other three remain Rust-only without being documented.
-        let problems = check(CORE, &bindings_that_call(&["with_base_url", "with_retry"]), guide);
+        let problems = check(
+            CORE,
+            &bindings_that_call(&["with_base_url", "with_retry"]),
+            guide,
+        );
         assert_eq!(problems.len(), 4, "{problems:?}");
         assert!(
             problems.iter().any(|p| p.contains("now reaches it")),
