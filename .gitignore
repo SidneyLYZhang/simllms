@@ -17,3 +17,4 @@ dist/
 # local agent configuration (deliberately not committed)
 agents/
 /.scratch/
+AGENTS.md
