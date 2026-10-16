@@ -9,7 +9,9 @@ assert, and the exception attributes must carry the provider's evidence
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -27,6 +29,7 @@ from simllms import (
     SimLLMError,
     TransportError,
 )
+from simllms import LOGGER_NAME
 
 SUCCESS_BODY = {
     "id": "chatcmpl-1",
@@ -53,7 +56,14 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         behavior = self.server.behavior  # type: ignore[attr-defined]
         behavior["request_log"].append(self._read_json())
+        self._route(behavior)
 
+    def do_GET(self) -> None:
+        behavior = self.server.behavior  # type: ignore[attr-defined]
+        behavior["request_log"].append(None)
+        self._route(behavior)
+
+    def _route(self, behavior: dict[str, Any]) -> None:
         for prefix, spec in behavior["routes"].items():
             if self.path.startswith(prefix):
                 spec["handler"](self)
@@ -295,3 +305,283 @@ def test_async_concurrent_chats(gateway: MockGateway) -> None:
 
     contents = asyncio.run(main())
     assert contents == ["hello from the mock"] * 5
+
+
+SSE_BODY = (
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"}}]}\n\n'
+    'data: {"choices":[{"index":0,"delta":{"content":"lo"}}]}\n\n'
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+    '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+def test_sync_stream_yields_normalized_chunks(gateway: MockGateway) -> None:
+    def sse(handler: MockHandler) -> None:
+        payload = SSE_BODY.encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    gateway.route("/v1/stream", sse)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/stream",
+    )
+
+    chunks = list(client.chat_stream(["hi"]))
+
+    assert [c.text for c in chunks if c.text is not None] == ["Hel", "lo"]
+    final = chunks[-1]
+    assert final.finish_reason == "stop"
+    assert final.total_tokens == 6
+    # The wire request carried the streaming opt-ins.
+    body = gateway.request_log[-1]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+
+
+def test_async_stream_yields_normalized_chunks(gateway: MockGateway) -> None:
+    def sse_slow(handler: MockHandler) -> None:
+        head, rest = SSE_BODY.split("\n\n", 1)  # first event, then the rest
+        payload1 = (head + "\n\n").encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(payload1)
+        handler.wfile.flush()
+        time.sleep(0.3)  # make the loop demonstrably free mid-stream
+        handler.wfile.write(rest.encode("utf-8"))
+        handler.wfile.flush()
+
+    gateway.route("/v1/stream", sse_slow)
+    client = simllms.AsyncClient(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/stream",
+    )
+
+    async def main() -> tuple[list[str], int]:
+        texts: list[str] = []
+        ticks = 0
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            async for chunk in client.chat_stream(["hi"]):
+                if chunk.text is not None:
+                    texts.append(chunk.text)
+        finally:
+            hb.cancel()
+        return texts, ticks
+
+    texts, ticks = asyncio.run(main())
+    assert texts == ["Hel", "lo"]
+    # The second event arrives 0.3s late; each chunk is fetched on a worker
+    # thread, so the loop must keep ticking through the wait.
+    assert ticks >= 3, f"event loop ticked only {ticks} times during stream"
+
+
+def test_structured_output_refusal_surfaces_locally() -> None:
+    # User-declared override tightens the model to no structured output: the
+    # Gate refuses before any network call (dead base_url would surface any
+    # live request as TransportError, never CapabilityError).
+    client = Client(
+        "deepseek",
+        "deepseek-v4-pro",
+        api_key="sk-test",
+        base_url="http://127.0.0.1:1",
+        capability_overrides={"structured_output": False},
+    )
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+
+    with pytest.raises(CapabilityError) as excinfo:
+        client.chat(["hi"], options={"response_schema": schema})
+
+    assert excinfo.value.missing == "StructuredOutput"
+    assert excinfo.value.model == "deepseek-v4-pro"
+
+
+def test_structured_output_reaches_the_wire_native_only(gateway: MockGateway) -> None:
+    client = make_client(gateway)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    client.chat(["hi"], options={"response_schema": schema})
+
+    body = gateway.request_log[-1]
+    # ADR-0004: native response_format only, never schema-as-prompt-text.
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "strict": True, "schema": schema},
+    }
+    assert json.dumps(schema) not in body["messages"][0]["content"]
+
+
+def test_generate_image_zhipu_url_shape(gateway: MockGateway) -> None:
+    def images(handler: MockHandler) -> None:
+        handler._respond(
+            200,
+            {
+                "data": [
+                    {
+                        "url": "https://img.example/cat.png",
+                        "revised_prompt": "a tabby cat",
+                    }
+                ]
+            },
+        )
+
+    gateway.route("/v1/images", images)
+    client = Client(
+        "zhipu",
+        "cogview-4",
+        api_key="sk-test",
+        base_url=gateway.base_url,
+    )
+
+    result = client.generate_image("a cat", size="1024x1024")
+
+    assert len(result) == 1
+    assert result[0].url == "https://img.example/cat.png"
+    assert result[0].data is None  # bytes-or-URL invariant
+    assert result[0].revised_prompt == "a tabby cat"
+    assert gateway.request_log[-1]["size"] == "1024x1024"
+
+
+def test_generate_image_openrouter_b64_shape(gateway: MockGateway) -> None:
+    png = b"\x89PNG fake bytes"
+
+    def images(handler: MockHandler) -> None:
+        handler._respond(
+            200,
+            {"data": [{"b64_json": base64.b64encode(png).decode("ascii")}]},
+        )
+
+    gateway.route("/v1/images", images)
+    client = make_client(gateway)
+
+    result = client.generate_image("a cat")
+
+    assert len(result) == 1
+    assert result[0].data == png
+    assert result[0].url is None
+
+
+def test_generate_image_dashscope_polling(gateway: MockGateway) -> None:
+    def submit(handler: MockHandler) -> None:
+        handler._respond(200, {"output": {"task_id": "t-9", "task_status": "PENDING"}})
+
+    polls = {"count": 0}
+
+    def poll(handler: MockHandler) -> None:
+        polls["count"] += 1
+        if polls["count"] < 3:
+            handler._respond(200, {"output": {"task_status": "PENDING"}})
+        else:
+            handler._respond(
+                200,
+                {
+                    "output": {
+                        "task_status": "SUCCEEDED",
+                        "results": [{"url": "https://img.example/q.png"}],
+                    }
+                },
+            )
+
+    gateway.route("/v1/api/v1/services/aigc/text2image/image-synthesis", submit)
+    gateway.route("/v1/api/v1/tasks/", poll)
+    client = Client(
+        "dashscope",
+        "wanx2.1-t2i-turbo",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/compatible-mode/v1",
+    )
+
+    result = client.generate_image("a cat", poll_interval=0.02)
+
+    assert result[0].url == "https://img.example/q.png"
+    assert polls["count"] == 3
+
+
+def test_async_generate_image_does_not_block_event_loop(gateway: MockGateway) -> None:
+    polls = {"count": 0}
+
+    def submit(handler: MockHandler) -> None:
+        handler._respond(200, {"output": {"task_id": "t-10", "task_status": "PENDING"}})
+
+    def poll(handler: MockHandler) -> None:
+        polls["count"] += 1
+        if polls["count"] < 4:
+            time.sleep(0.2)  # slow poll: the loop must stay free regardless
+            handler._respond(200, {"output": {"task_status": "PENDING"}})
+        else:
+            handler._respond(
+                200,
+                {
+                    "output": {
+                        "task_status": "SUCCEEDED",
+                        "results": [{"url": "https://img.example/q.png"}],
+                    }
+                },
+            )
+
+    gateway.route("/v1/api/v1/services/aigc/text2image/image-synthesis", submit)
+    gateway.route("/v1/api/v1/tasks/", poll)
+    client = simllms.AsyncClient(
+        "dashscope",
+        "wanx2.1-t2i-turbo",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/compatible-mode/v1",
+    )
+
+    async def main() -> int:
+        ticks = 0
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            result = await client.generate_image("a cat", poll_interval=0.02)
+            assert result[0].url == "https://img.example/q.png"
+        finally:
+            hb.cancel()
+        return ticks
+
+    ticks = asyncio.run(main())
+    assert ticks >= 5, f"event loop ticked only {ticks} times during image polling"
+
+
+def test_debug_request_is_credential_free(gateway: MockGateway) -> None:
+    client = make_client(gateway)
+    debug = client.debug_request(["hi"], options={"max_tokens": 32})
+
+    assert "test-model" in debug
+    assert "max_tokens" in debug
+    assert "sk-test" not in debug
+
+
+def test_logging_under_fixed_logger_name(
+    gateway: MockGateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        client = make_client(gateway)
+        client.chat(["hi"])
+
+    simllms_records = [r for r in caplog.records if r.name == LOGGER_NAME]
+    assert simllms_records, "no log records emitted under the simllms logger"
+    assert any("client created" in r.getMessage() for r in simllms_records)
+    assert any("chat" in r.getMessage() for r in simllms_records)
+    assert all("sk-test" not in r.getMessage() for r in simllms_records)

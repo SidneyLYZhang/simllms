@@ -351,6 +351,98 @@ struct Client {
     inner: Arc<simllms::Client>,
 }
 
+/// One normalized streaming step: a text or reasoning delta, plus the final
+/// chunk's finish reason and usage (token fields are None until the final
+/// chunk carries them).
+#[pyclass]
+struct PyChunk {
+    #[pyo3(get)]
+    index: u64,
+    #[pyo3(get)]
+    text: Option<String>,
+    #[pyo3(get)]
+    reasoning: Option<String>,
+    #[pyo3(get)]
+    finish_reason: Option<String>,
+    #[pyo3(get)]
+    prompt_tokens: Option<u64>,
+    #[pyo3(get)]
+    completion_tokens: Option<u64>,
+    #[pyo3(get)]
+    total_tokens: Option<u64>,
+}
+
+impl From<simllms::stream::Chunk> for PyChunk {
+    fn from(chunk: simllms::stream::Chunk) -> Self {
+        use simllms::stream::Delta;
+        let (text, reasoning) = match chunk.delta {
+            Some(Delta::Text { text }) => (Some(text), None),
+            Some(Delta::Reasoning { text }) => (None, Some(text)),
+            _ => (None, None),
+        };
+        PyChunk {
+            index: chunk.index,
+            text,
+            reasoning,
+            finish_reason: chunk.finish_reason,
+            prompt_tokens: chunk.usage.as_ref().and_then(|u| u.prompt_tokens),
+            completion_tokens: chunk.usage.as_ref().and_then(|u| u.completion_tokens),
+            total_tokens: chunk.usage.as_ref().and_then(|u| u.total_tokens),
+        }
+    }
+}
+
+/// Sync iterator over a `chat_stream`. Each `next()` parks the calling
+/// thread on one SSE event; the GIL is released while waiting. Errors
+/// raised mid-stream end the iteration on the following step.
+#[pyclass]
+struct PyChatStream {
+    stream: Arc<std::sync::Mutex<simllms::stream::ChatStream>>,
+}
+
+#[pymethods]
+impl PyChatStream {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyChunk>> {
+        let stream = self.stream.clone();
+        py.detach(move || {
+            let mut guard = stream.lock().expect("chat stream lock");
+            runtime()
+                .block_on(async { guard.next().await })
+                .map(|result| result.map(PyChunk::from))
+                .transpose()
+        })
+        .map_err(map_error)
+    }
+}
+
+/// One generated image: exactly one of `data` (bytes) or `url`.
+#[pyclass]
+struct PyGeneratedImage {
+    #[pyo3(get)]
+    data: Option<Vec<u8>>,
+    #[pyo3(get)]
+    url: Option<String>,
+    #[pyo3(get)]
+    mime_type: Option<String>,
+    #[pyo3(get)]
+    revised_prompt: Option<String>,
+}
+
+impl From<simllms::image::GeneratedImage> for PyGeneratedImage {
+    fn from(g: simllms::image::GeneratedImage) -> Self {
+        PyGeneratedImage {
+            data: g.data,
+            url: g.url,
+            mime_type: g.mime_type,
+            revised_prompt: g.revised_prompt,
+        }
+    }
+}
+
 #[pymethods]
 impl Client {
     #[new]
@@ -402,6 +494,83 @@ impl Client {
         })
     }
 
+    /// Stream a chat. Returns an iterator of Chunk; each `next()` blocks the
+    /// calling thread on one SSE event (the async path lives in the pure-
+    /// Python layer, which parks each step on a worker thread).
+    #[pyo3(signature = (messages, options=None))]
+    fn chat_stream(&self, py: Python<'_>, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<PyChatStream> {
+        let messages = parse_messages(messages)?;
+        let options = match options {
+            Some(dict) => parse_options(dict)?,
+            None => Options::default(),
+        };
+        let inner = self.inner.clone();
+        let stream = py
+            .detach(move || {
+                runtime()
+                    .block_on(async move { inner.chat_stream_with(messages, options).await })
+            })
+            .map_err(map_error)?;
+        Ok(PyChatStream {
+            stream: Arc::new(std::sync::Mutex::new(stream)),
+        })
+    }
+
+    /// Generate an image. Unsupported parameters for this provider/model
+    /// raise ConfigError naming the parameter; result is a list of
+    /// GeneratedImage (bytes-or-URL invariant).
+    #[pyo3(signature = (prompt, *, size=None, aspect_ratio=None, n=None, negative_prompt=None, seed=None, quality=None, output_format=None, background=None, poll_interval=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate_image(
+        &self,
+        py: Python<'_>,
+        prompt: String,
+        size: Option<String>,
+        aspect_ratio: Option<String>,
+        n: Option<u32>,
+        negative_prompt: Option<String>,
+        seed: Option<i64>,
+        quality: Option<String>,
+        output_format: Option<String>,
+        background: Option<String>,
+        poll_interval: Option<f64>,
+    ) -> PyResult<Vec<PyGeneratedImage>> {
+        let request = simllms::ImageRequest {
+            prompt,
+            size,
+            aspect_ratio,
+            n,
+            negative_prompt,
+            seed,
+            quality,
+            output_format,
+            background,
+            input_references: Vec::new(),
+        };
+        let mut knobs = simllms::ImageKnobs::default();
+        if let Some(seconds) = poll_interval {
+            knobs.poll_interval = Duration::from_secs_f64(seconds);
+        }
+        let inner = self.inner.clone();
+        py.detach(move || {
+            runtime()
+                .block_on(async move { inner.generate_image_with(request, knobs).await })
+                .map(|reply| reply.images.into_iter().map(PyGeneratedImage::from).collect())
+                .map_err(map_error)
+        })
+    }
+
+    /// The exact request this client would send, credential-free.
+    #[pyo3(signature = (messages, options=None))]
+    fn debug_request(&self, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
+        let messages = parse_messages(messages)?;
+        let options = match options {
+            Some(dict) => parse_options(dict)?,
+            None => Options::default(),
+        };
+        Ok(self.inner.debug_request(&messages, &options))
+    }
+
     fn __repr__(&self) -> String {
         "simllms.Client(...)".to_string()
     }
@@ -416,5 +585,8 @@ fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     m.add_class::<Client>()?;
     m.add("Reply", m.py().get_type::<PyReply>())?;
+    m.add("Chunk", m.py().get_type::<PyChunk>())?;
+    m.add_class::<PyChatStream>()?;
+    m.add("GeneratedImage", m.py().get_type::<PyGeneratedImage>())?;
     Ok(())
 }
