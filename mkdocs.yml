@@ -1,0 +1,52 @@
+site_name: simllms
+site_description: >-
+  One client shape for every major LLM provider — impossible requests are
+  refused locally, before you pay for them.
+site_url: https://sidneylyzhang.github.io/simllms/
+repo_url: https://github.com/SidneyLYZhang/simllms
+repo_name: SidneyLYZhang/simllms
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: 切换深色
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: 切换浅色
+  language: zh
+
+# docs/agents/ is wiring for repository agents, not for site readers.
+exclude_docs: |
+  agents/
+
+nav:
+  - 快速开始: getting-started.md
+  - 对话: chat.md
+  - 流式输出: streaming.md
+  - 结构化输出: structured-output.md
+  - 图像生成: image-generation.md
+  - 能力门: capabilities.md
+  - 自定义网关: custom-gateway.md
+  - 变更日志: changelog.md
+  - 架构决策 / ADR:
+      - 0001: adr/0001-core-crate-never-links-python.md
+      - 0002: adr/0002-capability-catalog-three-layers.md
+      - 0003: adr/0003-python-asyncclient-bridges-threads.md
+      - 0004: adr/0004-structured-output-is-native-only.md
+      - 0005: adr/0005-unknown-model-ids-warn-and-pass.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true
