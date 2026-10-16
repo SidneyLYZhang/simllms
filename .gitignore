@@ -1,3 +1,4 @@
+# Rust build
 /target
 
 # Python / maturin
@@ -7,10 +8,12 @@ __pycache__/
 dist/
 .venv/
 
+# mkdocs build output
+/site/
+
 # generated docs navigation copy of the root changelog
 /docs/changelog.md
 
-# LLM
+# local agent configuration (deliberately not committed)
 agents/
 /.scratch/
-AGENTS.md/site/
