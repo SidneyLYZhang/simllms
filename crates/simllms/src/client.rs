@@ -1,10 +1,13 @@
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::capabilities::{Capabilities, CapabilityOverrides, ResolvedCapabilities, Source};
 use crate::catalog::Catalog;
-use crate::capabilities::{CapabilityOverrides, ResolvedCapabilities};
 use crate::dialect;
-use crate::error::{ApiError, CapabilityError, ConfigError, Error, MissingCapability, TransportError};
+use crate::error::{
+    ApiError, CapabilityError, ConfigError, Error, MissingCapability, TransportError,
+};
 use crate::gate::{self, ChatRequest};
 use crate::message::Message;
 use crate::options::Options;
@@ -21,13 +24,19 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        RetryPolicy { enabled: true, max_attempts: 3 }
+        RetryPolicy {
+            enabled: true,
+            max_attempts: 3,
+        }
     }
 }
 
 impl RetryPolicy {
     pub fn disabled() -> Self {
-        RetryPolicy { enabled: false, max_attempts: 1 }
+        RetryPolicy {
+            enabled: false,
+            max_attempts: 1,
+        }
     }
 }
 
@@ -74,6 +83,9 @@ pub struct Client {
     stream_idle_timeout: Duration,
     default_headers: Vec<(String, String)>,
     http: reqwest::Client,
+    /// Populated only by an explicit `refresh_models()`; never on the
+    /// request path. Lock is held briefly and never across an await.
+    refreshed: RwLock<BTreeMap<String, crate::refresh::RefreshedModel>>,
 }
 
 impl Client {
@@ -95,6 +107,7 @@ impl Client {
             http: reqwest::Client::builder()
                 .build()
                 .expect("reqwest client with rustls should always build"),
+            refreshed: RwLock::new(BTreeMap::new()),
         }
         .with_default_auth()
     }
@@ -182,11 +195,7 @@ impl Client {
 
     /// Overrides the streaming timeouts: the first event must arrive within
     /// `first_token`, and every subsequent event within `idle`.
-    pub fn with_stream_timeouts(
-        mut self,
-        first_token: Duration,
-        idle: Duration,
-    ) -> Self {
+    pub fn with_stream_timeouts(mut self, first_token: Duration, idle: Duration) -> Self {
         self.stream_first_token_timeout = first_token;
         self.stream_idle_timeout = idle;
         self
@@ -206,21 +215,38 @@ impl Client {
 
     /// Chat with per-request Options layered over the client's own
     /// (per-request wins, see `Options::layered`).
-    pub async fn chat_with(&self, messages: Vec<Message>, options: Options) -> Result<Reply, Error> {
+    pub async fn chat_with(
+        &self,
+        messages: Vec<Message>,
+        options: Options,
+    ) -> Result<Reply, Error> {
         let merged = Options::layered(self.options.clone(), options);
-        let request = ChatRequest { messages, options: merged, stream: false };
+        let request = ChatRequest {
+            messages,
+            options: merged,
+            stream: false,
+        };
 
         let resolved = self.resolve();
         gate::gate(&resolved, &request, self.provider, &self.model).map_err(|e| self.enrich(e))?;
 
-        let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, false);
+        let body = dialect::chat_body(
+            self.provider,
+            &self.model,
+            &request.messages,
+            &request.options,
+            false,
+        );
         self.send(&body).await
     }
 
     /// Streaming variant of `chat`: same Client, same Gate, same dialect.
     /// The returned `ChatStream` normalizes every provider into the same
     /// chunk sequence; dropping it cancels the request.
-    pub async fn chat_stream(&self, messages: Vec<Message>) -> Result<crate::stream::ChatStream, Error> {
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<crate::stream::ChatStream, Error> {
         self.chat_stream_with(messages, Options::default()).await
     }
 
@@ -230,12 +256,22 @@ impl Client {
         options: Options,
     ) -> Result<crate::stream::ChatStream, Error> {
         let merged = Options::layered(self.options.clone(), options);
-        let request = ChatRequest { messages, options: merged, stream: true };
+        let request = ChatRequest {
+            messages,
+            options: merged,
+            stream: true,
+        };
 
         let resolved = self.resolve();
         gate::gate(&resolved, &request, self.provider, &self.model).map_err(|e| self.enrich(e))?;
 
-        let body = dialect::chat_body(self.provider, &self.model, &request.messages, &request.options, true);
+        let body = dialect::chat_body(
+            self.provider,
+            &self.model,
+            &request.messages,
+            &request.options,
+            true,
+        );
         let url = self.url()?;
         let mut request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
         // Qwen's streaming endpoints require an explicit SSE opt-in header;
@@ -243,17 +279,19 @@ impl Client {
         if self.provider == Provider::DashScope {
             request = request.header("X-DashScope-SSE", "enable");
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let response = request.send().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            let raw_body = response
-                .text()
-                .await
-                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            let raw_body = response.text().await.map_err(|e| {
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                })
+            })?;
             return Err(Error::Api(ApiError {
                 status,
                 provider_message: extract_provider_message(&raw_body),
@@ -269,21 +307,39 @@ impl Client {
     }
 
     fn resolve(&self) -> ResolvedCapabilities {
-        let base = default_catalog().resolve(self.provider, &self.model);
+        // Precedence: user > provider (refreshed listing) > catalog. A
+        // listing entry confirms existence, so an unknown model that shows
+        // up in the provider's own list becomes Known at Source::Provider.
+        let refreshed = self
+            .refreshed
+            .read()
+            .expect("refreshed lock")
+            .get(&self.model)
+            .cloned();
+        let merged = match default_catalog().resolve(self.provider, &self.model) {
+            ResolvedCapabilities::Known(caps) => match &refreshed {
+                Some(r) => crate::refresh::apply(caps, r),
+                None => caps,
+            },
+            ResolvedCapabilities::Unknown => match refreshed {
+                Some(r) => crate::refresh::apply(Capabilities::text_only(Source::Catalog), &r),
+                // A user override turns an unknown gateway model into a
+                // Known record with the declared Capabilities (Source::User).
+                None => {
+                    if self.overrides == CapabilityOverrides::default() {
+                        return ResolvedCapabilities::Unknown;
+                    }
+                    return ResolvedCapabilities::Known(
+                        self.overrides
+                            .apply_to(Capabilities::text_only(Source::Catalog)),
+                    );
+                }
+            },
+        };
         if self.overrides == CapabilityOverrides::default() {
-            return base;
-        }
-        match base {
-            ResolvedCapabilities::Known(caps) => {
-                ResolvedCapabilities::Known(self.overrides.apply_to(caps))
-            }
-            // A user override turns an unknown gateway model into a Known
-            // record with the declared Capabilities (Source::User).
-            ResolvedCapabilities::Unknown => ResolvedCapabilities::Known(
-                self.overrides.apply_to(crate::capabilities::Capabilities::text_only(
-                    crate::capabilities::Source::Catalog,
-                )),
-            ),
+            ResolvedCapabilities::Known(merged)
+        } else {
+            ResolvedCapabilities::Known(self.overrides.apply_to(merged))
         }
     }
 
@@ -323,7 +379,8 @@ impl Client {
         &self,
         request: crate::image::ImageRequest,
     ) -> Result<crate::image::ImageReply, Error> {
-        self.generate_image_with(request, crate::image::ImageKnobs::default()).await
+        self.generate_image_with(request, crate::image::ImageKnobs::default())
+            .await
     }
 
     pub async fn generate_image_with(
@@ -333,9 +390,10 @@ impl Client {
     ) -> Result<crate::image::ImageReply, Error> {
         let resolved = default_catalog().resolve(self.provider, &self.model);
         let image_generation = match &resolved {
-            ResolvedCapabilities::Known(caps) => {
-                self.overrides.image_generation.unwrap_or(caps.image_generation)
-            }
+            ResolvedCapabilities::Known(caps) => self
+                .overrides
+                .image_generation
+                .unwrap_or(caps.image_generation),
             // Catalog miss warns and passes (ADR-0005); the capability check
             // is skipped but the parameter checks still run.
             ResolvedCapabilities::Unknown => true,
@@ -349,17 +407,24 @@ impl Client {
                     "{}/images/generations",
                     self.url()?.trim_end_matches("/chat/completions")
                 );
-                self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
-                    .await
+                self.image_sync(
+                    url,
+                    crate::image::translate(self.provider, &self.model, &request),
+                )
+                .await
             }
             Provider::OpenRouter => {
-                let url = format!("{}/images", self.url()?.trim_end_matches("/chat/completions"));
-                self.image_sync(url, crate::image::translate(self.provider, &self.model, &request))
-                    .await
+                let url = format!(
+                    "{}/images",
+                    self.url()?.trim_end_matches("/chat/completions")
+                );
+                self.image_sync(
+                    url,
+                    crate::image::translate(self.provider, &self.model, &request),
+                )
+                .await
             }
-            Provider::DashScope => {
-                self.image_dashscope(request, knobs).await
-            }
+            Provider::DashScope => self.image_dashscope(request, knobs).await,
             _ => Err(Error::Capability(CapabilityError::without_suggestions(
                 &self.model,
                 MissingCapability::ImageGeneration,
@@ -383,15 +448,17 @@ impl Client {
         body: serde_json::Value,
     ) -> Result<crate::image::ImageReply, Error> {
         let request = self.apply_auth(self.http.post(&url).timeout(self.timeout).json(&body));
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let response = request.send().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
         let status = response.status().as_u16();
-        let raw_body = response
-            .text()
-            .await
-            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let raw_body = response.text().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
         if !(200..300).contains(&status) {
             return Err(Error::Api(ApiError {
                 status,
@@ -419,17 +486,24 @@ impl Client {
         let body = crate::image::translate(self.provider, &self.model, &request);
 
         let submit = self
-            .apply_auth(self.http.post(&submit_url).timeout(self.timeout).json(&body))
+            .apply_auth(
+                self.http
+                    .post(&submit_url)
+                    .timeout(self.timeout)
+                    .json(&body),
+            )
             .header("X-DashScope-Async", "enable");
-        let response = submit
-            .send()
-            .await
-            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let response = submit.send().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
         let status = response.status().as_u16();
-        let raw = response
-            .text()
-            .await
-            .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+        let raw = response.text().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
         if !(200..300).contains(&status) {
             return Err(Error::Api(ApiError {
                 status,
@@ -438,16 +512,22 @@ impl Client {
             }));
         }
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            Error::Api(ApiError { status, provider_message: format!("malformed submit response: {e}"), raw_body: raw })
+            Error::Api(ApiError {
+                status,
+                provider_message: format!("malformed submit response: {e}"),
+                raw_body: raw,
+            })
         })?;
         let task_id = parsed
             .pointer("/output/task_id")
             .and_then(|t| t.as_str())
-            .ok_or_else(|| Error::Api(ApiError {
-                status,
-                provider_message: "submit response has no output.task_id".into(),
-                raw_body: parsed.to_string(),
-            }))?
+            .ok_or_else(|| {
+                Error::Api(ApiError {
+                    status,
+                    provider_message: "submit response has no output.task_id".into(),
+                    raw_body: parsed.to_string(),
+                })
+            })?
             .to_string();
 
         let poll_url = format!("{root}/api/v1/tasks/{task_id}");
@@ -463,15 +543,17 @@ impl Client {
             }
             tokio::time::sleep(knobs.poll_interval).await;
             let poll = self.apply_auth(self.http.get(&poll_url).timeout(self.timeout));
-            let response = poll
-                .send()
-                .await
-                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            let response = poll.send().await.map_err(|e| {
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                })
+            })?;
             let status = response.status().as_u16();
-            let raw = response
-                .text()
-                .await
-                .map_err(|e| Error::Transport(TransportError { message: e.to_string() }))?;
+            let raw = response.text().await.map_err(|e| {
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                })
+            })?;
             if !(200..300).contains(&status) {
                 return Err(Error::Api(ApiError {
                     status,
@@ -480,23 +562,35 @@ impl Client {
                 }));
             }
             let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-                Error::Api(ApiError { status, provider_message: format!("malformed poll response: {e}"), raw_body: raw })
+                Error::Api(ApiError {
+                    status,
+                    provider_message: format!("malformed poll response: {e}"),
+                    raw_body: raw,
+                })
             })?;
-            match parsed.pointer("/output/task_status").and_then(|s| s.as_str()) {
+            match parsed
+                .pointer("/output/task_status")
+                .and_then(|s| s.as_str())
+            {
                 Some("SUCCEEDED") => {
                     let urls: Vec<String> = parsed
                         .pointer("/output/results")
                         .and_then(|r| r.as_array())
                         .map(|a| {
                             a.iter()
-                                .filter_map(|i| i.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                                .filter_map(|i| {
+                                    i.get("url").and_then(|u| u.as_str()).map(str::to_string)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
                     return Ok(crate::image::ImageReply {
                         images: urls
                             .into_iter()
-                            .map(|url| crate::image::GeneratedImage { url: Some(url), ..Default::default() })
+                            .map(|url| crate::image::GeneratedImage {
+                                url: Some(url),
+                                ..Default::default()
+                            })
                             .collect(),
                     });
                 }
@@ -514,6 +608,80 @@ impl Client {
                 _ => continue, // PENDING / RUNNING
             }
         }
+    }
+
+    /// Consults the provider's own model listing and merges it under the
+    /// Source precedence user > provider > catalog. Nothing on the request
+    /// path calls this: it runs when you call it. Only DeepSeek, Moonshot,
+    /// DashScope and OpenRouter publish machine-readable listings; other
+    /// providers return a `Config` error, and the catalog stays
+    /// authoritative. A failed fetch is a distinguishable error and leaves
+    /// any previously refreshed state untouched. Single attempt — no retry.
+    pub async fn refresh_models(&self) -> Result<Vec<String>, Error> {
+        use crate::provider::Provider as P;
+        match self.provider {
+            P::Zhipu => {
+                return Err(self.enrich(Error::Config(ConfigError {
+                    message: "provider `zhipu` publishes no machine-readable model listing; capabilities come from the catalog plus capability overrides".into(),
+                })))
+            }
+            P::MiMo => {
+                return Err(self.enrich(Error::Config(ConfigError {
+                    message: "provider `mimo` publishes no machine-readable model listing; capabilities come from the catalog plus capability overrides".into(),
+                })))
+            }
+            P::Custom => {
+                return Err(self.enrich(Error::Config(ConfigError {
+                    message: "provider `custom` has no model listing to consult; declare capabilities with capability_overrides".into(),
+                })))
+            }
+            _ => {}
+        }
+
+        let url = format!(
+            "{}/models",
+            self.url()?.trim_end_matches("/chat/completions")
+        );
+        let response = self
+            .apply_auth(self.http.get(&url).timeout(self.timeout))
+            .send()
+            .await
+            .map_err(|e| {
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                })
+            })?;
+        let status = response.status().as_u16();
+        let raw_body = response.text().await.map_err(|e| {
+            Error::Transport(TransportError {
+                message: e.to_string(),
+            })
+        })?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Api(ApiError {
+                status,
+                provider_message: extract_provider_message(&raw_body),
+                raw_body,
+            }));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
+            Error::Api(ApiError {
+                status,
+                provider_message: format!("malformed model listing: {e}"),
+                raw_body: raw_body.clone(),
+            })
+        })?;
+        let models = crate::refresh::parse_listing(&parsed)?;
+
+        let ids: Vec<String> = {
+            let mut map = self.refreshed.write().expect("refreshed lock");
+            map.clear();
+            for m in models {
+                map.insert(m.id.clone(), m);
+            }
+            map.keys().cloned().collect()
+        };
+        Ok(ids)
     }
 
     /// Preview of what the Gate would warn about — e.g. an unknown gateway
@@ -535,10 +703,12 @@ impl Client {
     fn enrich(&self, error: Error) -> Error {
         match error {
             Error::Capability(ce)
-                if ce.missing == MissingCapability::StructuredOutput && ce.suggestions.is_empty() =>
+                if ce.missing == MissingCapability::StructuredOutput
+                    && ce.suggestions.is_empty() =>
             {
                 Error::Capability(CapabilityError {
-                    suggestions: default_catalog().models_with(self.provider, |c| c.structured_output),
+                    suggestions: default_catalog()
+                        .models_with(self.provider, |c| c.structured_output),
                     ..ce
                 })
             }
@@ -592,15 +762,14 @@ impl Client {
         body: &serde_json::Value,
     ) -> Result<Reply, (Error, Option<Duration>)> {
         let request = self.apply_auth(self.http.post(url).timeout(self.timeout).json(body));
-        let response = request
-            .send()
-            .await
-            .map_err(|e| {
-                (
-                    Error::Transport(TransportError { message: e.to_string() }),
-                    None,
-                )
-            })?;
+        let response = request.send().await.map_err(|e| {
+            (
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                }),
+                None,
+            )
+        })?;
 
         let status = response.status().as_u16();
         // Headers are gone once the body is read, so Retry-After is captured
@@ -612,10 +781,14 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs);
-        let raw_body = response
-            .text()
-            .await
-            .map_err(|e| (Error::Transport(TransportError { message: e.to_string() }), None))?;
+        let raw_body = response.text().await.map_err(|e| {
+            (
+                Error::Transport(TransportError {
+                    message: e.to_string(),
+                }),
+                None,
+            )
+        })?;
 
         if !(200..300).contains(&status) {
             let retryable = status == 429 || status >= 500;
@@ -660,9 +833,9 @@ fn backoff_delay(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::capabilities::Modality;
+    use crate::message::Role;
     use crate::message::{ContentBlock, ImageSource};
     use mockito::{Matcher, Server};
-    use crate::message::Role;
 
     fn success_body() -> String {
         serde_json::json!({
@@ -700,8 +873,14 @@ mod tests {
 
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url())
-            .with_options(Options { max_tokens: Some(64), ..Default::default() });
-        let reply = client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+            .with_options(Options {
+                max_tokens: Some(64),
+                ..Default::default()
+            });
+        let reply = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
 
         mock.assert_async().await;
         assert_eq!(reply.content, "hi there");
@@ -722,7 +901,10 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-wrong")
             .with_base_url(server.url())
             .with_retry(RetryPolicy::disabled());
-        let err = client.chat(vec![Message::text("hello")]).await.expect_err("401 must fail");
+        let err = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect_err("401 must fail");
         assert!(!err.is_retryable());
         mock.assert_async().await;
         match err {
@@ -742,7 +924,10 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url("not a url at all")
             .with_retry(RetryPolicy::disabled());
-        let err = client.chat(vec![Message::text("hello")]).await.expect_err("must fail");
+        let err = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect_err("must fail");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
         assert!(err.is_retryable());
     }
@@ -761,7 +946,10 @@ mod tests {
 
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url());
-        let reply = client.chat(vec![Message::text("hello")]).await.expect("retry must recover");
+        let reply = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("retry must recover");
 
         failing.assert_async().await;
         ok.assert_async().await;
@@ -785,7 +973,10 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url());
         let start = std::time::Instant::now();
-        client.chat(vec![Message::text("hello")]).await.expect("must recover");
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("must recover");
         let elapsed = start.elapsed();
 
         failing.assert_async().await;
@@ -808,7 +999,10 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url())
             .with_retry(RetryPolicy::disabled());
-        let err = client.chat(vec![Message::text("hello")]).await.expect_err("429 must fail");
+        let err = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect_err("429 must fail");
 
         failing.assert_async().await;
         assert!(matches!(err, Error::Api(e) if e.status == 429));
@@ -822,7 +1016,10 @@ mod tests {
             .with_base_url("http://10.255.255.1:1")
             .with_timeout(Duration::from_millis(100))
             .with_retry(RetryPolicy::disabled());
-        let err = client.chat(vec![Message::text("hello")]).await.expect_err("must time out");
+        let err = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect_err("must time out");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
     }
 
@@ -834,10 +1031,17 @@ mod tests {
 
     #[test]
     fn debug_request_has_no_credential_material() {
-        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-secret-do-not-leak");
+        let client = Client::new(
+            Provider::DeepSeek,
+            "deepseek-v4-pro",
+            "sk-secret-do-not-leak",
+        );
         let rendered = client.debug_request(
             &[Message::text("hello")],
-            &Options { max_tokens: Some(32), ..Default::default() },
+            &Options {
+                max_tokens: Some(32),
+                ..Default::default()
+            },
         );
         assert!(rendered.contains("deepseek-v4-pro"));
         assert!(rendered.contains("hello"));
@@ -856,7 +1060,10 @@ mod tests {
                 ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
             ],
         )];
-        let err = client.chat(messages).await.expect_err("image to text-only model must fail locally");
+        let err = client
+            .chat(messages)
+            .await
+            .expect_err("image to text-only model must fail locally");
         match err {
             Error::Capability(e) => {
                 assert_eq!(e.model, "deepseek-v4-pro");
@@ -870,7 +1077,9 @@ mod tests {
     fn default_catalog_knows_vision_models() {
         let caps = default_catalog().resolve(Provider::Moonshot, "kimi-k3");
         match caps {
-            ResolvedCapabilities::Known(c) => assert!(c.input_modalities.contains(&Modality::Image)),
+            ResolvedCapabilities::Known(c) => {
+                assert!(c.input_modalities.contains(&Modality::Image))
+            }
             other => panic!("kimi-k3 must be known, got {other:?}"),
         }
     }
@@ -905,7 +1114,10 @@ mod tests {
 
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url());
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
 
         let mut deltas = Vec::new();
         let mut last_usage = None;
@@ -951,7 +1163,10 @@ mod tests {
 
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url());
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
 
         let mut partial = String::new();
         let err = loop {
@@ -983,7 +1198,8 @@ mod tests {
             .mock("POST", "/chat/completions")
             .with_chunked_body(|w| {
                 std::thread::sleep(Duration::from_millis(600));
-                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n");
+                let _ =
+                    w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n");
                 Ok(())
             })
             .create_async()
@@ -992,8 +1208,15 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url())
             .with_stream_timeouts(Duration::from_millis(50), Duration::from_secs(90));
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
-        let err = stream.next().await.expect("must yield an item").expect_err("must be a timeout");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
+        let err = stream
+            .next()
+            .await
+            .expect("must yield an item")
+            .expect_err("must be a timeout");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
         assert!(err.to_string().contains("first stream event"));
     }
@@ -1004,9 +1227,11 @@ mod tests {
         server
             .mock("POST", "/chat/completions")
             .with_chunked_body(|w| {
-                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"soon\"}}]}\n\n");
+                let _ =
+                    w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"soon\"}}]}\n\n");
                 std::thread::sleep(Duration::from_millis(600));
-                let _ = w.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"too late\"}}]}\n\n");
+                let _ = w
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"too late\"}}]}\n\n");
                 Ok(())
             })
             .create_async()
@@ -1015,11 +1240,24 @@ mod tests {
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url())
             .with_stream_timeouts(Duration::from_secs(60), Duration::from_millis(50));
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
 
-        let first = stream.next().await.expect("first chunk").expect("first chunk ok");
-        assert!(matches!(first.delta, Some(crate::stream::Delta::Text { ref text }) if text == "soon"));
-        let err = stream.next().await.expect("must yield an item").expect_err("must be idle timeout");
+        let first = stream
+            .next()
+            .await
+            .expect("first chunk")
+            .expect("first chunk ok");
+        assert!(
+            matches!(first.delta, Some(crate::stream::Delta::Text { ref text }) if text == "soon")
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("must yield an item")
+            .expect_err("must be idle timeout");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
         assert!(err.to_string().contains("idle timeout"));
     }
@@ -1035,7 +1273,10 @@ mod tests {
 
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
             .with_base_url(server.url());
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
         let _ = stream.next().await;
         drop(stream); // cancels the request; must not block or panic
     }
@@ -1049,9 +1290,12 @@ mod tests {
             .with_body(success_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::Moonshot, "kimi-k3", "sk-kimi")
-            .with_base_url(server.url());
-        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        let client =
+            Client::new(Provider::Moonshot, "kimi-k3", "sk-kimi").with_base_url(server.url());
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
         mock.assert_async().await;
     }
 
@@ -1069,7 +1313,10 @@ mod tests {
             .await;
         let client = Client::new(Provider::OpenRouter, "deepseek/deepseek-v4-pro", "sk-or")
             .with_base_url(server.url());
-        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
         mock.assert_async().await;
     }
 
@@ -1082,9 +1329,12 @@ mod tests {
             .with_body(success_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo")
-            .with_base_url(server.url());
-        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        let client =
+            Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo").with_base_url(server.url());
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
         mock.assert_async().await;
     }
 
@@ -1097,9 +1347,12 @@ mod tests {
             .with_body(sse_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo")
-            .with_base_url(server.url());
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let client =
+            Client::new(Provider::MiMo, "mimo-v2.5", "sk-mimo").with_base_url(server.url());
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
         let chunk = stream.next().await.expect("first chunk").expect("chunk ok");
         assert!(chunk.delta.is_some());
     }
@@ -1112,7 +1365,8 @@ mod tests {
         // tests on multiple threads, so a name collision would race — these
         // names are unique per test below.
         unsafe { std::env::set_var(name, "sk-env") };
-        let client = Client::from_env(Provider::OpenRouter, "deepseek/deepseek-v4-pro").expect("env key must be found");
+        let client = Client::from_env(Provider::OpenRouter, "deepseek/deepseek-v4-pro")
+            .expect("env key must be found");
         assert_eq!(client.api_key, "sk-env");
 
         unsafe { std::env::remove_var(name) };
@@ -1130,13 +1384,18 @@ mod tests {
         let mock = server
             .mock("POST", "/chat/completions")
             .match_header("authorization", "Bearer sk-dash")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "model": "qwen-plus" })))
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "model": "qwen-plus" }),
+            ))
             .with_body(success_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::DashScope, "qwen-plus", "sk-dash")
-            .with_base_url(server.url());
-        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        let client =
+            Client::new(Provider::DashScope, "qwen-plus", "sk-dash").with_base_url(server.url());
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
         mock.assert_async().await;
     }
 
@@ -1149,9 +1408,12 @@ mod tests {
             .with_body(sse_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::DashScope, "qwen-plus", "sk-dash")
-            .with_base_url(server.url());
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream must start");
+        let client =
+            Client::new(Provider::DashScope, "qwen-plus", "sk-dash").with_base_url(server.url());
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
         let chunk = stream.next().await.expect("first chunk").expect("chunk ok");
         assert!(chunk.delta.is_some());
     }
@@ -1176,11 +1438,12 @@ mod tests {
             "https://llm-xxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
         );
 
-        let client = Client::new(Provider::DashScope, "qwen-plus", "sk")
-            .with_dashscope_region(DashScopeRegion::Workspace {
+        let client = Client::new(Provider::DashScope, "qwen-plus", "sk").with_dashscope_region(
+            DashScopeRegion::Workspace {
                 id: "llm-xxx".into(),
                 region: crate::provider::DASHSCOPE_AP_SOUTHEAST_1,
-            });
+            },
+        );
         assert_eq!(
             client.url().expect("built-in provider has a base url"),
             "https://llm-xxx.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
@@ -1193,23 +1456,33 @@ mod tests {
         let mock = server
             .mock("POST", "/chat/completions")
             .match_header("authorization", "Bearer sk-glm")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "model": "glm-5.3" })))
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "model": "glm-5.3" }),
+            ))
             .with_body(success_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::Zhipu, "glm-5.3", "sk-glm")
-            .with_base_url(server.url());
-        client.chat(vec![Message::text("hello")]).await.expect("chat must succeed");
+        let client = Client::new(Provider::Zhipu, "glm-5.3", "sk-glm").with_base_url(server.url());
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat must succeed");
         mock.assert_async().await;
     }
 
     #[test]
     fn zhipu_international_host_selectable() {
         let client = Client::new(Provider::Zhipu, "glm-5.3", "sk").with_zhipu_international();
-        assert_eq!(client.url().expect("url"), "https://api.z.ai/api/paas/v4/chat/completions");
+        assert_eq!(
+            client.url().expect("url"),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
         // CN remains the default.
         let client = Client::new(Provider::Zhipu, "glm-5.3", "sk");
-        assert_eq!(client.url().expect("url"), "https://open.bigmodel.cn/api/paas/v4/chat/completions");
+        assert_eq!(
+            client.url().expect("url"),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
     }
 
     #[tokio::test]
@@ -1236,7 +1509,10 @@ mod tests {
         client
             .chat_with(
                 vec![Message::text("give an answer")],
-                Options { response_schema: Some(schema), ..Default::default() },
+                Options {
+                    response_schema: Some(schema),
+                    ..Default::default()
+                },
             )
             .await
             .expect("capable model must serve the schema");
@@ -1251,7 +1527,10 @@ mod tests {
         let err = client
             .chat_with(
                 vec![Message::text("give an answer")],
-                Options { response_schema: Some(serde_json::json!({"type": "object"})), ..Default::default() },
+                Options {
+                    response_schema: Some(serde_json::json!({"type": "object"})),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("glm-5 must be refused locally");
@@ -1274,16 +1553,23 @@ mod tests {
         // The schema appears only in response_format; messages are untouched
         // and no JSON instructions are injected anywhere in the body.
         let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test");
-        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
         let rendered = client.debug_request(
             &[Message::text("give an answer")],
-            &Options { response_schema: Some(schema), ..Default::default() },
+            &Options {
+                response_schema: Some(schema),
+                ..Default::default()
+            },
         );
         let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let messages = body.get("messages").expect("messages present");
         assert_eq!(messages.as_array().unwrap().len(), 1);
         assert_eq!(messages[0]["content"], "give an answer");
-        assert_eq!(body.pointer("/response_format/type"), Some(&serde_json::json!("json_schema")));
+        assert_eq!(
+            body.pointer("/response_format/type"),
+            Some(&serde_json::json!("json_schema"))
+        );
         let outside_messages = rendered.split("\"messages\"").next().unwrap_or("");
         assert!(
             !outside_messages.to_lowercase().contains("json"),
@@ -1301,32 +1587,47 @@ mod tests {
                 "model": "cogview-4",
                 "prompt": "a cat"
             })))
-            .with_body(serde_json::json!({ "data": [{ "url": "https://img.example/cat.png" }] }).to_string())
+            .with_body(
+                serde_json::json!({ "data": [{ "url": "https://img.example/cat.png" }] })
+                    .to_string(),
+            )
             .create_async()
             .await;
-        let client = Client::new(Provider::Zhipu, "cogview-4", "sk-glm")
-            .with_base_url(server.url());
-        let reply = client.generate_image(crate::image::ImageRequest::new("a cat")).await.expect("must succeed");
+        let client =
+            Client::new(Provider::Zhipu, "cogview-4", "sk-glm").with_base_url(server.url());
+        let reply = client
+            .generate_image(crate::image::ImageRequest::new("a cat"))
+            .await
+            .expect("must succeed");
         mock.assert_async().await;
         assert_eq!(reply.images.len(), 1);
-        assert_eq!(reply.images[0].url.as_deref(), Some("https://img.example/cat.png"));
+        assert_eq!(
+            reply.images[0].url.as_deref(),
+            Some("https://img.example/cat.png")
+        );
         assert!(reply.images[0].data.is_none());
     }
 
     #[tokio::test]
     async fn openrouter_image_generation_returns_bytes() {
         let mut server = Server::new_async().await;
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG-data");
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG-data");
         let mock = server
             .mock("POST", "/images")
             .match_header("authorization", "Bearer sk-or")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "prompt": "a cat" })))
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "prompt": "a cat" }),
+            ))
             .with_body(serde_json::json!({ "data": [{ "b64_json": b64 }] }).to_string())
             .create_async()
             .await;
         let client = Client::new(Provider::OpenRouter, "google/gemini-image", "sk-or")
             .with_base_url(server.url());
-        let reply = client.generate_image(crate::image::ImageRequest::new("a cat")).await.expect("must succeed");
+        let reply = client
+            .generate_image(crate::image::ImageRequest::new("a cat"))
+            .await
+            .expect("must succeed");
         mock.assert_async().await;
         assert_eq!(reply.images[0].data.as_deref(), Some(&b"\x89PNG-data"[..]));
         assert!(reply.images[0].url.is_none());
@@ -1339,7 +1640,10 @@ mod tests {
             .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
             .match_header("X-DashScope-Async", "enable")
             .match_header("authorization", "Bearer sk-dash")
-            .with_body(serde_json::json!({ "output": { "task_id": "t-1", "task_status": "PENDING" } }).to_string())
+            .with_body(
+                serde_json::json!({ "output": { "task_id": "t-1", "task_status": "PENDING" } })
+                    .to_string(),
+            )
             .create_async()
             .await;
         // First poll is still PENDING, second succeeds — full lifecycle.
@@ -1370,7 +1674,10 @@ mod tests {
         submit.assert_async().await;
         pending.assert_async().await;
         done.assert_async().await;
-        assert_eq!(reply.images[0].url.as_deref(), Some("https://img.example/q.png"));
+        assert_eq!(
+            reply.images[0].url.as_deref(),
+            Some("https://img.example/q.png")
+        );
     }
 
     #[tokio::test]
@@ -1378,14 +1685,20 @@ mod tests {
         let mut server = Server::new_async().await;
         server
             .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
-            .with_body(serde_json::json!({ "output": { "task_id": "t-2", "task_status": "PENDING" } }).to_string())
+            .with_body(
+                serde_json::json!({ "output": { "task_id": "t-2", "task_status": "PENDING" } })
+                    .to_string(),
+            )
             .create_async()
             .await;
         server
             .mock("GET", "/api/v1/tasks/t-2")
-            .with_body(serde_json::json!({
-                "output": { "task_status": "FAILED", "message": "sensitive content detected" }
-            }).to_string())
+            .with_body(
+                serde_json::json!({
+                    "output": { "task_status": "FAILED", "message": "sensitive content detected" }
+                })
+                .to_string(),
+            )
             .create_async()
             .await;
 
@@ -1410,7 +1723,10 @@ mod tests {
         let mut server = Server::new_async().await;
         server
             .mock("POST", "/api/v1/services/aigc/text2image/image-synthesis")
-            .with_body(serde_json::json!({ "output": { "task_id": "t-3", "task_status": "PENDING" } }).to_string())
+            .with_body(
+                serde_json::json!({ "output": { "task_id": "t-3", "task_status": "PENDING" } })
+                    .to_string(),
+            )
             .create_async()
             .await;
         server
@@ -1440,15 +1756,14 @@ mod tests {
             .generate_image(crate::image::ImageRequest::new("a cat"))
             .await
             .expect_err("must refuse locally");
-        assert!(matches!(err, Error::Capability(e) if e.missing == MissingCapability::ImageGeneration));
+        assert!(
+            matches!(err, Error::Capability(e) if e.missing == MissingCapability::ImageGeneration)
+        );
     }
 
     #[tokio::test]
     async fn custom_provider_with_bearer_and_header_auth() {
-        for (name, matcher) in [
-            ("bearer", "Bearer sk-gw"),
-            ("header", "x-token: sk-gw"),
-        ] {
+        for (name, matcher) in [("bearer", "Bearer sk-gw"), ("header", "x-token: sk-gw")] {
             let mut server = Server::new_async().await;
             let mut mock = server
                 .mock("POST", "/chat/completions")
@@ -1468,9 +1783,15 @@ mod tests {
             let client = if name == "bearer" {
                 base
             } else {
-                base.with_auth(Auth::Header { name: "x-token".into(), value: "sk-gw".into() })
+                base.with_auth(Auth::Header {
+                    name: "x-token".into(),
+                    value: "sk-gw".into(),
+                })
             };
-            client.chat(vec![Message::text("hello")]).await.expect("gateway chat must succeed");
+            client
+                .chat(vec![Message::text("hello")])
+                .await
+                .expect("gateway chat must succeed");
             mock.assert_async().await;
         }
     }
@@ -1496,8 +1817,14 @@ mod tests {
         let client = Client::new(Provider::Custom, "my-gateway-model", "sk")
             .with_base_url(server.url())
             .with_default_header("x-correlation-id", "simllms-test");
-        client.chat(vec![Message::text("hello")]).await.expect("chat ok");
-        let mut stream = client.chat_stream(vec![Message::text("hello")]).await.expect("stream ok");
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat ok");
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream ok");
         while stream.next().await.is_some() {}
         chat.assert_async().await;
         sse.assert_async().await;
@@ -1515,9 +1842,15 @@ mod tests {
             .with_base_url(server.url());
 
         let warns = client.warnings(&[Message::text("hello")], &Options::default());
-        assert!(matches!(warns.as_slice(), [gate::Warning::UnknownModel { .. }]));
+        assert!(matches!(
+            warns.as_slice(),
+            [gate::Warning::UnknownModel { .. }]
+        ));
 
-        let reply = client.chat(vec![Message::text("hello")]).await.expect("warn-and-pass");
+        let reply = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("warn-and-pass");
         assert_eq!(reply.content, "hi there");
         mock.assert_async().await;
     }
@@ -1537,17 +1870,25 @@ mod tests {
         let err = client
             .chat_with(
                 vec![Message::text("hello")],
-                Options { response_schema: Some(serde_json::json!({"type": "object"})), ..Default::default() },
+                Options {
+                    response_schema: Some(serde_json::json!({"type": "object"})),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("tightened override must refuse");
-        assert!(matches!(err, Error::Capability(e) if e.missing == MissingCapability::StructuredOutput));
+        assert!(
+            matches!(err, Error::Capability(e) if e.missing == MissingCapability::StructuredOutput)
+        );
     }
 
     #[tokio::test]
     async fn custom_without_base_url_is_a_config_error() {
         let client = Client::new(Provider::Custom, "m", "sk");
-        let err = client.chat(vec![Message::text("hello")]).await.expect_err("must fail locally");
+        let err = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect_err("must fail locally");
         assert!(matches!(err, Error::Config(_)), "got {err:?}");
         assert!(err.to_string().contains("with_base_url"));
     }
@@ -1567,11 +1908,306 @@ mod tests {
             .with_body(success_body())
             .create_async()
             .await;
-        let client = Client::new(Provider::Custom, "my-gateway-model", "sk")
-            .with_base_url(server.url());
-        let reply = client.chat(vec![Message::text("hello")]).await.expect("retry must recover");
+        let client =
+            Client::new(Provider::Custom, "my-gateway-model", "sk").with_base_url(server.url());
+        let reply = client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("retry must recover");
         failing.assert_async().await;
         ok.assert_async().await;
         assert_eq!(reply.content, "hi there");
+    }
+
+    async fn mock_listing(server: &mut Server, body: String) -> mockito::Mock {
+        server
+            .mock("GET", "/models")
+            .match_header("authorization", "Bearer sk-test")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn refresh_models_lists_deepseek_and_moonshot_shapes() {
+        // Both providers ship id-only OpenAI lists: existence is confirmed,
+        // capability fields are absent and must not be invented.
+        for provider in [Provider::DeepSeek, Provider::Moonshot] {
+            let mut server = Server::new_async().await;
+            let mock = mock_listing(
+                &mut server,
+                serde_json::json!({
+                    "object": "list",
+                    "data": [{ "id": "listed-model" }, { "object": "model", "id": "other-model" }]
+                })
+                .to_string(),
+            )
+            .await;
+            let client =
+                Client::new(provider, "listed-model", "sk-test").with_base_url(server.url());
+            let ids = client.refresh_models().await.expect("refresh succeeds");
+            mock.assert_async().await;
+            assert_eq!(
+                ids,
+                vec!["listed-model".to_string(), "other-model".to_string()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_models_dashscope_shape() {
+        let mut server = Server::new_async().await;
+        let mock = mock_listing(
+            &mut server,
+            serde_json::json!({
+                "data": [{ "id": "qwen-listed" }]
+            })
+            .to_string(),
+        )
+        .await;
+        let client =
+            Client::new(Provider::DashScope, "qwen-listed", "sk-test").with_base_url(server.url());
+        let ids = client.refresh_models().await.expect("refresh succeeds");
+        mock.assert_async().await;
+        assert_eq!(ids, vec!["qwen-listed".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn refresh_models_openrouter_rich_shape_beats_catalog() {
+        // A listing entry with explicit modalities/params outranks the
+        // catalog field-wise. "not-listed-but-cataloged" would refuse images
+        // from the catalog; the refreshed record passes them through.
+        let mut server = Server::new_async().await;
+        let listing = mock_listing(
+            &mut server,
+            serde_json::json!({
+                "data": [{
+                    "id": "vendor/model",
+                    "architecture": { "input_modalities": ["text", "image"] },
+                    "supported_parameters": ["response_format", "tools"],
+                    "context_length": 131072
+                }]
+            })
+            .to_string(),
+        )
+        .await;
+        let chat = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::OpenRouter, "vendor/model", "sk-test")
+            .with_base_url(server.url());
+        let ids = client.refresh_models().await.expect("refresh succeeds");
+        listing.assert_async().await;
+        assert_eq!(ids, vec!["vendor/model".to_string()]);
+
+        // Gate now passes an image message (catalog alone would have to
+        // decide; this model is catalog-unknown, so pre-refresh it was
+        // warn-and-pass and post-refresh it is Known image-capable).
+        let image_message = Message::blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text("what is this?".into()),
+                ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
+            ],
+        );
+        client
+            .chat(vec![image_message])
+            .await
+            .expect("gate passes refreshed image capability");
+        chat.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn refreshed_existence_beats_unknown_warn_and_pass() {
+        // Unknown model + id-only listing: existence is confirmed, image
+        // input is NOT (inherited base is text-only), so the gate refuses
+        // instead of warn-and-passing.
+        let mut server = Server::new_async().await;
+        let _listing = mock_listing(
+            &mut server,
+            serde_json::json!({ "data": [{ "id": "fresh-model" }] }).to_string(),
+        )
+        .await;
+        let client =
+            Client::new(Provider::OpenRouter, "fresh-model", "sk-test").with_base_url(server.url());
+        client.refresh_models().await.expect("refresh succeeds");
+
+        let image_message = Message::blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text("what is this?".into()),
+                ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
+            ],
+        );
+        let err = client
+            .chat(vec![image_message])
+            .await
+            .expect_err("gate must refuse");
+        match err {
+            Error::Capability(e) => assert_eq!(e.missing, MissingCapability::ImageInput),
+            other => panic!("expected Capability, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_override_still_outranks_refreshed_listing() {
+        let mut server = Server::new_async().await;
+        let _listing = mock_listing(
+            &mut server,
+            serde_json::json!({
+                "data": [{
+                    "id": "vendor/model",
+                    "architecture": { "input_modalities": ["text", "image"] }
+                }]
+            })
+            .to_string(),
+        )
+        .await;
+        let client = Client::new(Provider::OpenRouter, "vendor/model", "sk-test")
+            .with_base_url(server.url())
+            .with_capability_overrides(crate::capabilities::CapabilityOverrides {
+                image_input: Some(false),
+                ..Default::default()
+            });
+        client.refresh_models().await.expect("refresh succeeds");
+
+        let image_message = Message::blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text("what is this?".into()),
+                ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
+            ],
+        );
+        let err = client
+            .chat(vec![image_message])
+            .await
+            .expect_err("user tighten wins");
+        match err {
+            Error::Capability(e) => assert_eq!(e.missing, MissingCapability::ImageInput),
+            other => panic!("expected Capability, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_leaves_prior_state_intact() {
+        let mut server = Server::new_async().await;
+        let _ok = mock_listing(
+            &mut server,
+            serde_json::json!({ "data": [{ "id": "good-model" }] }).to_string(),
+        )
+        .await;
+        let client =
+            Client::new(Provider::OpenRouter, "good-model", "sk-test").with_base_url(server.url());
+        client
+            .refresh_models()
+            .await
+            .expect("first refresh succeeds");
+
+        let _bad = server
+            .mock("GET", "/models")
+            .with_status(500)
+            .with_body(r#"{"error":{"message":"boom"}}"#)
+            .create_async()
+            .await;
+        let err = client
+            .refresh_models()
+            .await
+            .expect_err("second refresh fails");
+        match &err {
+            Error::Api(e) => {
+                assert_eq!(e.status, 500);
+                assert_eq!(e.provider_message, "boom");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+
+        // Prior state is untouched: the gate still knows good-model exists.
+        let image_message = Message::blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text("what is this?".into()),
+                ContentBlock::Image(ImageSource::Url("https://example.com/cat.png".into())),
+            ],
+        );
+        let err = client
+            .chat(vec![image_message])
+            .await
+            .expect_err("state intact");
+        assert!(matches!(err, Error::Capability(_)));
+    }
+
+    #[tokio::test]
+    async fn unexpected_listing_shape_is_distinguishable_and_non_destructive() {
+        let mut server = Server::new_async().await;
+        let _ok = mock_listing(
+            &mut server,
+            serde_json::json!({ "data": [{ "id": "m1" }] }).to_string(),
+        )
+        .await;
+        let client = Client::new(Provider::OpenRouter, "m1", "sk-test").with_base_url(server.url());
+        client
+            .refresh_models()
+            .await
+            .expect("first refresh succeeds");
+
+        let _bad = server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_body(r#"{"models": [{"id": "m1"}]}"#)
+            .create_async()
+            .await;
+        let err = client.refresh_models().await.expect_err("schema error");
+        match &err {
+            Error::Api(e) => {
+                assert_eq!(e.status, 0);
+                assert!(e.raw_body.contains("\"models\""));
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+        // Prior refreshed state survives the failed parse.
+        assert!(client.refreshed.read().unwrap().contains_key("m1"));
+    }
+
+    #[tokio::test]
+    async fn refresh_models_config_errors_for_undocumented_providers() {
+        for provider in [Provider::Zhipu, Provider::MiMo, Provider::Custom] {
+            let mut server = Server::new_async().await;
+            // Any hit would panic on drop-verification with expect(0).
+            let _models = server.mock("GET", "/models").expect(0).create_async().await;
+            let client = Client::new(provider, "some-model", "sk-test").with_base_url(server.url());
+            let err = client
+                .refresh_models()
+                .await
+                .expect_err("no listing schema for this provider");
+            assert!(
+                matches!(err, Error::Config(_)),
+                "expected Config for {provider}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_path_never_triggers_a_refresh() {
+        // A full chat against a server where /models is pinned to zero
+        // hits: gate resolution stays purely catalog + overrides.
+        let mut server = Server::new_async().await;
+        let _models = server.mock("GET", "/models").expect(0).create_async().await;
+        let chat = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(success_body())
+            .create_async()
+            .await;
+        let client = Client::new(Provider::OpenRouter, "unknown-gateway-model", "sk-test")
+            .with_base_url(server.url());
+        client
+            .chat(vec![Message::text("hello")])
+            .await
+            .expect("chat succeeds");
+        chat.assert_async().await;
     }
 }
