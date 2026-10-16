@@ -87,4 +87,4 @@ missing capability ImageInput; capable models on this provider: deepseek-v4-flas
 - [custom-gateway.md](custom-gateway.md) — 自建/网关提供商
 
 所有示例无凭据即可运行（本地模拟），设置对应 API key 后走真实提供商：
-见 [README 的示例表](https://github.com/SidneyLYZhang/simllms#可运行的示例--runnable-examples)。
+见 [README 的示例表](https://github.com/SidneyLYZhang/simllms#可运行的示例)。
