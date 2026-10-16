@@ -16,9 +16,12 @@ keywords = ["llm", "openai-compatible", "deepseek", "moonshot", "qwen"]
 # instead of letting extra files out. `include` cannot reach above the crate
 # directory, which is why the licenses, the attribution, the changelog and the
 # English README are copies that `cargo xtask sync-package` writes.
+# The sources are named as files, not as directories: a bare `src` is a recursive
+# grab that never consults `.gitignore`, so an ignored neighbour of the sources
+# would be published with them.
 include = [
-    "src",
-    "examples",
+    "src/*.rs",
+    "examples/*.rs",
     "README.en.md",
     "CHANGELOG.md",
     "LICENSE-MIT",

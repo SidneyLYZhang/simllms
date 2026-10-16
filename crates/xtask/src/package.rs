@@ -36,6 +36,14 @@ pub const PYTHON_INIT: &str = "crates/simllms-python/python/simllms/__init__.py"
 /// What the crate's own source tree has to contribute to the package.
 const CRATE_SOURCE_DIRS: &[&str] = &["src", "examples"];
 
+/// How those directories belong in the whitelist: as the files they hold, never
+/// as the directory. A bare directory entry is a recursive grab that does not
+/// consult version control, so an ignored neighbour inside it — a stray
+/// `src/__pycache__/`, an editor's backup — would be published. A glob names the
+/// source and nothing else, which is what "the crate states what it carries"
+/// has to mean.
+const CRATE_SOURCE_GLOBS: &[&str] = &["src/*.rs", "examples/*.rs"];
+
 /// Files cargo puts in a `.crate` whatever the manifest asks for.
 const CARGO_FORCED: &[&str] = &[
     ".cargo_vcs_info.json",
@@ -123,14 +131,25 @@ pub fn check_crate_manifest(text: &str, root_manifest: &str) -> Vec<String> {
         problems.push(format!(
             "{CRATE_MANIFEST} has no `[package] include` list — a published crate states what it \
              carries, so that packing the wrong thing goes red instead of letting extra files \
-             out. List `{CRATE_SOURCE_DIRS:?}` and {CARRIED_FILES:?} there"
+             out. List `{CRATE_SOURCE_GLOBS:?}` and {CARRIED_FILES:?} there"
         ));
     } else {
-        for required in CRATE_SOURCE_DIRS {
-            if !covers(&include, required) {
+        for required in CRATE_SOURCE_GLOBS {
+            if !include.iter().any(|entry| entry == required) {
                 problems.push(format!(
                     "{CRATE_MANIFEST} does not list `{required}` under `[package] include`, so \
-                     {CRATE_DIR}/{required} would be left out of the crate"
+                     {CRATE_DIR}/{} would be left out of the crate",
+                    required.split('/').next().unwrap_or(required)
+                ));
+            }
+        }
+        for directory in CRATE_SOURCE_DIRS {
+            if include.iter().any(|entry| entry == directory) {
+                problems.push(format!(
+                    "{CRATE_MANIFEST} whitelists `{directory}` as a directory under \
+                     `[package] include` — cargo takes everything inside it without asking the \
+                     version control system, so an ignored neighbour of the sources would be \
+                     published. List `{directory}/*.rs`, which names the source and nothing else"
                 ));
             }
         }
@@ -408,12 +427,39 @@ fn link_targets(text: &str) -> Vec<String> {
 }
 
 /// Does a whitelist entry bring `path` along? A directory entry covers its
-/// contents, and a `/**` suffix says the same thing louder.
+/// contents, a `/**` suffix says the same thing louder, and a `*` stands for the
+/// part of one name the writer did not want to enumerate.
 fn covers(patterns: &[String], path: &str) -> bool {
-    patterns.iter().any(|pattern| {
-        let pattern = pattern.trim_end_matches("/**").trim_end_matches('/');
-        pattern == path || path.starts_with(&format!("{pattern}/"))
-    })
+    patterns.iter().any(|pattern| matches(pattern, path))
+}
+
+/// A wildcard never crosses a `/`, which is what makes `src/*.rs` a statement
+/// about the sources rather than a grab at whatever directory turns up beside
+/// them. One `*` per segment is all a manifest has to be able to say.
+fn matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_end_matches("/**").trim_end_matches('/');
+    if pattern == path || path.starts_with(&format!("{pattern}/")) {
+        return true;
+    }
+    let wanted: Vec<&str> = pattern.split('/').collect();
+    let packed: Vec<&str> = path.split('/').collect();
+    wanted.len() == packed.len()
+        && wanted
+            .iter()
+            .zip(packed)
+            .all(|(want, have)| wildcard(want, have))
+}
+
+fn wildcard(want: &str, have: &str) -> bool {
+    match want.split_once('*') {
+        None => want == have,
+        Some((head, tail)) => {
+            !tail.contains('*')
+                && have.len() >= head.len() + tail.len()
+                && have.starts_with(head)
+                && have.ends_with(tail)
+        }
+    }
 }
 
 /// The carried files a whitelist still leaves out — the rule both manifests
@@ -513,7 +559,7 @@ mod tests {
     }
 
     fn carried_include() -> String {
-        let mut entries: Vec<String> = CRATE_SOURCE_DIRS
+        let mut entries: Vec<String> = CRATE_SOURCE_GLOBS
             .iter()
             .map(|d| format!("\"{d}\""))
             .collect();
@@ -588,7 +634,7 @@ include = [
     #[test]
     fn a_whitelist_that_forgets_the_attribution_is_red() {
         let manifest = crate_manifest(
-            r#""src", "examples", "README.en.md", "LICENSE-MIT", "LICENSE-APACHE", "CHANGELOG.md""#,
+            r#""src/*.rs", "examples/*.rs", "README.en.md", "LICENSE-MIT", "LICENSE-APACHE", "CHANGELOG.md""#,
             "\"llm\", \"openai-compatible\"",
         );
         let problems = crate_problems(&manifest);
@@ -600,11 +646,58 @@ include = [
     }
 
     #[test]
+    fn a_whitelisted_directory_would_pack_whatever_ignores_say_nothing_about() {
+        // Proven on this machine: `include = ["src"]` packed a `src/__pycache__/`
+        // that `.gitignore` matches, because a bare directory entry is a recursive
+        // grab that never consults version control. So the whitelist has to name
+        // files, and a directory entry has to be an error rather than a habit.
+        let manifest = crate_manifest(
+            &carried_include().replace("\"src/*.rs\"", "\"src\""),
+            "\"llm\", \"openai-compatible\"",
+        );
+        let problems = crate_problems(&manifest);
+        let named: Vec<&String> = problems
+            .iter()
+            .filter(|p| p.contains("whitelists `src` as a directory"))
+            .collect();
+        assert_eq!(named.len(), 1, "{problems:?}");
+        assert!(
+            named[0].contains("src/*.rs"),
+            "must say what to write instead: {named:?}"
+        );
+    }
+
+    #[test]
+    fn a_source_tree_the_whitelist_does_not_reach_is_red() {
+        let manifest = crate_manifest(
+            &carried_include().replace("\"examples/*.rs\"", "\"docs/*.md\""),
+            "\"llm\", \"openai-compatible\"",
+        );
+        let problems = crate_problems(&manifest);
+        assert!(
+            problems.iter().any(|p| p.contains("examples/*.rs")),
+            "must say which sources went unpacked: {problems:?}"
+        );
+    }
+
+    #[test]
     fn a_directory_entry_covers_its_contents() {
         let patterns = vec!["src".to_string(), "examples/**".to_string()];
         assert!(covers(&patterns, "src/lib.rs"));
         assert!(covers(&patterns, "examples/chat_stream.rs"));
         assert!(!covers(&patterns, "LICENSE-MIT"));
+    }
+
+    #[test]
+    fn a_glob_covers_one_segment_and_nothing_below_it() {
+        let patterns = vec!["src/*.rs".to_string()];
+        assert!(covers(&patterns, "src/lib.rs"));
+        assert!(
+            !covers(&patterns, "src/__pycache__/keep.pyc"),
+            "the point of the glob: an ignored neighbour does not ride along"
+        );
+        assert!(!covers(&patterns, "src/deep/module.rs"));
+        assert!(!covers(&patterns, "src/lib.rs.orig"));
     }
 
     #[test]

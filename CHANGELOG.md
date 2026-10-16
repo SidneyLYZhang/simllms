@@ -34,8 +34,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   package, where `docs/getting-started.md` and `crates/…/examples/…` are not
   there to be found — and `cargo xtask check-package` now refuses any carried
   file that links to something which does not travel with it.
+- **The whole release line runs without publishing anything.**
+  `.github/workflows/release.yml` starts on a version tag or on a hand dispatch
+  whose `dry_run` input defaults to the rehearsal. The pull-request gate's family
+  runs again there; five wheels build from one abi3 extension each (manylinux
+  x86_64 and aarch64 from pinned `manylinux_2_28` images, the latter
+  cross-compiled rather than emulated, macOS x86_64 and arm64 as two separate
+  wheels, Windows amd64); the crate and the sdist come from their own packagers;
+  and only `publish-python` and `publish-crate` — each behind the shared
+  approval environment and an explicit `dry_run` test — reach a registry. A
+  rehearsal skips those two visibly rather than leaving them out of the run.
+- `cargo xtask check-release <tag>` refuses a tag with a pre-release or build
+  suffix, a tag whose number differs from the Authoritative Version, a tag on a
+  commit that has not landed on `main`, and a version the changelog holds no
+  dated section for — naming the rule that fired each time. `cargo xtask
+  release-tag` answers what tag this commit would become, which is the only
+  question a rehearsal can ask.
+- `cargo xtask check-workflow` reads the release file and holds it to itself: the
+  triggers, the pinned base images, the absence of an emulator, one abi3 wheel
+  per platform, build and publish as separate jobs joined by artifacts, and every
+  gate the pull-request path runs. `cargo xtask check-artifacts <dir> --tag <tag>`
+  compares a built artifact set against the intended platforms, so a missing
+  platform and an unexpected extra both go red.
+- `crates/simllms-python/tests/test_release_artifacts.py` runs against an
+  installed wheel in a venv that never saw the checkout: the reported version is
+  the tag's, the version comes out of the compiled extension, the licenses and
+  the attribution sit where an installer looks, a Gate refusal raises the typed
+  capability error without a network call, and the request debugger renders an
+  outbound body with no credential in it. The release path fails the run if any
+  of those checks skipped.
 
 ### Changed
+
+- The crate's whitelist names `src/*.rs` and `examples/*.rs` rather than the two
+  directories. `cargo package` reaches into a listed directory without asking
+  version control, so a bare `src` would publish an ignored neighbour of the
+  sources — a stray `src/__pycache__/` or an editor's backup. `check-package`
+  refuses a directory entry, and the release job plants a marker inside every
+  ignored directory before packing, so the artifact checks prove it stayed out.
 
 - The Python distribution declares `license = "MIT OR Apache-2.0"` as an SPDX
   expression with `license-files` (PEP 639, `Metadata-Version: 2.4`) instead

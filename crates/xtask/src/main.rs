@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 mod docs;
 mod manifest;
 mod package;
+mod release;
 mod version;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -43,14 +44,150 @@ fn main() {
         }
         Some("check-package") => check_package(std::env::args().skip(2)),
         Some("check-docs") => check_docs(),
+        Some("check-workflow") => check_workflow(),
+        Some("release-tag") => release_tag(),
+        Some("check-release") => check_release(std::env::args().skip(2)),
+        Some("check-artifacts") => check_artifacts(std::env::args().skip(2)),
         _ => {
             eprintln!(
                 "usage: cargo xtask refresh-catalog [--check] | sync-version [--check] | \
-                 sync-package [--check] | check-package [--crate-listing <file|->] | check-docs"
+                 sync-package [--check] | check-package [--crate-listing <file|->] | check-docs | \
+                 check-workflow | release-tag | check-release <tag> [--commit <sha>] | \
+                 check-artifacts <dir> --tag <tag>"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// The tag this tree would be released under, on stdout: `v` and the Authoritative
+/// Version. A dry-run dispatch has no tag to read, and the number a tag would have
+/// to carry is the one the workspace already declares — so the derivation stays
+/// here rather than becoming a shell `grep` of `Cargo.toml`.
+fn release_tag() {
+    let root_manifest = read(&path(version::ROOT_MANIFEST));
+    let authoritative = version::authoritative_version(&root_manifest)
+        .unwrap_or_else(|problem| panic!("{problem}"));
+    println!("v{authoritative}");
+}
+
+/// Is this tag allowed to become a release? Every rule is named by the check that
+/// refused, so a rejected tag says which decision it failed rather than only that
+/// a job went red.
+fn check_release(args: impl Iterator<Item = String>) {
+    let args: Vec<String> = args.collect();
+    let Some(tag) = args.first().map(String::as_str) else {
+        eprintln!("usage: cargo xtask check-release <vX.Y.Z> [--commit <sha>]");
+        std::process::exit(2);
+    };
+    let commit = arg_after(&args, "--commit").unwrap_or_else(|| "HEAD".to_string());
+    let root_manifest = read(&path(version::ROOT_MANIFEST));
+    let authoritative = version::authoritative_version(&root_manifest)
+        .unwrap_or_else(|problem| panic!("{problem}"));
+    let changelog = read(&path(release::CHANGELOG));
+
+    let mut problems = release::check_tag(tag);
+    problems.extend(release::check_tag_version(tag, &authoritative));
+    problems.extend(release::check_ancestor(tag, is_ancestor_of_main(&commit)));
+    if let Some(number) = release::tag_version(tag) {
+        problems.extend(release::check_changelog(&changelog, number));
+    }
+    finish(
+        problems,
+        &format!("`{tag}` may be released: the version is final, current, reviewed and dated"),
+    );
+}
+
+/// Is `commit` reachable from `main`? `git` answers; an unusable `main` is
+/// reported as itself, because "not an ancestor" and "I could not tell" are
+/// different facts and only one of them is a decision about the tag.
+fn is_ancestor_of_main(commit: &str) -> bool {
+    const MAIN: &str = "origin/main";
+    let output = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", commit, MAIN])
+        .status()
+        .expect("run `git merge-base`");
+    if output.success() {
+        return true;
+    }
+    if output.code() == Some(1) {
+        return false;
+    }
+    eprintln!(
+        "`git merge-base --is-ancestor {commit} {MAIN}` could not decide — the release line fetches `main` before it asks (checkout with `fetch-depth: 0` and `git fetch origin {MAIN}:…`)."
+    );
+    std::process::exit(1);
+}
+
+/// The artifact set, judged against the intended platform set. A directory the
+/// release run filled, and the tag it was asked to publish.
+fn check_artifacts(args: impl Iterator<Item = String>) {
+    let args: Vec<String> = args.collect();
+    let Some(directory) = args.first().map(String::as_str) else {
+        eprintln!("usage: cargo xtask check-artifacts <dir> --tag <vX.Y.Z>");
+        std::process::exit(2);
+    };
+    let Some(tag) = arg_after(&args, "--tag") else {
+        eprintln!(
+            "`check-artifacts` needs `--tag`, or the version the artifacts have to carry is a guess."
+        );
+        std::process::exit(2);
+    };
+    let Some(version) = release::tag_version(&tag) else {
+        eprintln!("`{tag}` is not a release tag, so nothing can be compared to it.");
+        std::process::exit(1);
+    };
+    let entries = fs::read_dir(path(directory)).unwrap_or_else(|e| {
+        panic!(
+            "read the artifact directory {directory}: {e} — an empty set is a failed build, not a release"
+        )
+    });
+    let mut names: Vec<String> = entries
+        .map(|entry| {
+            let entry = entry.expect("read an artifact directory entry");
+            entry.file_name().to_string_lossy().into_owned()
+        })
+        .collect();
+    names.sort();
+    finish(
+        release::check_artifacts(&names, version),
+        &format!(
+            "the artifacts are the {version} release line intended: no platform missing, none extra"
+        ),
+    );
+}
+
+/// The release line's own configuration, read out of the file: what it may be
+/// triggered by, what it builds, who approves publication, and whether the
+/// pull-request gates run again here.
+fn check_workflow() {
+    let ci = read(&path(release::CI_WORKFLOW));
+    let problems = match read_copy(&path(release::RELEASE_WORKFLOW)) {
+        None => vec![format!(
+            "`{}` does not exist — the release line is a file, not an intention.",
+            release::RELEASE_WORKFLOW
+        )],
+        Some(text) => {
+            let mut problems = release::check_triggers(&text);
+            problems.extend(release::check_dispatch(&text));
+            problems.extend(release::check_matrix(&text));
+            problems.extend(release::check_separation(&text));
+            problems.extend(release::check_gate_parity(&ci, &text));
+            problems
+        }
+    };
+    finish(
+        problems,
+        "the release line is triggered, built, gated and inventoried as the ticket says",
+    );
+}
+
+/// `--flag value` in a run's arguments, if it is there.
+fn arg_after(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }
 
 /// The guide's Rust-only list must equal the gap between what the core Client

@@ -1,0 +1,289 @@
+name: Release
+
+# Two ways to start this, and no others: a version tag, and a hand dispatch that
+# can declare itself a rehearsal. A comment on an issue or a pull request is not a
+# release request, so neither is a trigger here.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and inspect every artifact, publish nothing
+        type: boolean
+        # Default to the rehearsal: a release is what somebody opts into, not what
+        # a forgotten checkbox does.
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Gates, tag rules, and the crate's own packager
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The ancestor rule compares the tagged commit against `main`, which a
+          # tag checkout does not carry.
+          fetch-depth: 0
+      - name: Make origin/main a ref
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The pull-request gate's whole family runs again here. A release that relies
+      # on a check which only exists in the pull-request path is a release that has
+      # never been through that check.
+      - name: cargo test
+        run: cargo test --workspace
+      - name: Generated catalog is in sync
+        run: cargo xtask refresh-catalog --check
+      - name: Authoritative Version is derived everywhere
+        run: cargo xtask sync-version --check
+      - name: Packed crate carries exactly what its manifest promises
+        run: |
+          cargo package --list --offline --allow-dirty -p simllms \
+            | cargo xtask check-package --crate-listing -
+      - name: Rust-only entry-point list matches the bindings
+        run: cargo xtask check-docs
+      - name: The release line describes itself truthfully
+        run: cargo xtask check-workflow
+
+      - name: The tag this run is about
+        id: release
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            # A rehearsal has no tag, so it takes the number a tag would have to
+            # carry: the Authoritative Version of the commit it was dispatched on.
+            echo "tag=$(cargo xtask release-tag)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: This tag may become a release
+        run: cargo xtask check-release "${{ steps.release.outputs.tag }}"
+
+      # The cargo half, verified without a token: the packager's list mode and a
+      # publish dry-run. Nothing here can reach the registry, which is the point.
+      # The dry-run is not `--no-verify`: compiling the unpacked crate is how a
+      # whitelist that stopped reaching its sources fails here rather than on a
+      # caller's machine after the number is burned.
+      - name: The publish dry-run, with no token in sight
+        env:
+          CARGO_REGISTRY_TOKEN: ''
+        run: cargo publish --dry-run --allow-dirty -p simllms
+
+  wheels:
+    name: ${{ matrix.label }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A platform that fails is reported, not hidden behind the first failure:
+      # the release line is fixed forward.
+      fail-fast: false
+      matrix:
+        include:
+          # The manylinux baseline is named rather than defaulted: the glibc a
+          # wheel promises is the glibc it was built against.
+          - label: manylinux x86_64
+            id: manylinux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_28_x86_64:2026.10.10-1
+          # The rust-cross image compiles aarch64 on an x86_64 runner. An emulated
+          # official image would build the same wheel name out of a toolchain
+          # nothing else in this line uses.
+          - label: manylinux aarch64
+            id: manylinux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
+          # Two wheels, not one fat binary: `abi3` is what makes each of them cover
+          # every supported interpreter.
+          - label: macOS x86_64
+            id: macos-x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - label: macOS arm64
+            id: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - label: Windows amd64
+            id: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add the Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          manylinux: '2_28'
+          target: ${{ matrix.target }}
+          container: ${{ matrix.container }}
+          working-directory: crates/simllms-python
+          args: --release --out dist
+      - name: One abi3 wheel, and only one
+        shell: bash
+        run: |
+          ls crates/simllms-python/dist/
+          test "$(ls crates/simllms-python/dist/*.whl | wc -l)" -eq 1
+          ls crates/simllms-python/dist/*.whl | grep -q -- -abi3-
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.id }}
+          path: crates/simllms-python/dist/*.whl
+          if-no-files-found: error
+
+  distributions:
+    name: sdist and crate, through their own packagers
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - name: Plant the directories a checkout accumulates
+        # The proof is a marker inside each one: if an ignored directory could
+        # reach an archive, this run would say so rather than a person finding a
+        # `target/` inside a published sdist. Both crates get one, because the
+        # sdist carries a copy of the core crate alongside the binding.
+        run: |
+          mkdir -p target/noise .venv/noise \
+            crates/simllms-python/target/noise \
+            crates/simllms-python/.venv/noise \
+            crates/simllms-python/python/simllms/__pycache__ \
+            crates/simllms/target/noise \
+            crates/simllms/src/__pycache__
+          touch .venv/noise/keep.txt target/noise/keep.txt \
+            crates/simllms-python/target/noise/keep.txt \
+            crates/simllms-python/.venv/noise/keep.txt \
+            crates/simllms-python/python/simllms/__pycache__/keep.pyc \
+            crates/simllms/target/noise/keep.txt \
+            crates/simllms/src/__pycache__/keep.pyc
+      - name: Pack the crate
+        run: cargo package --allow-dirty -p simllms
+      - name: Build the sdist
+        working-directory: crates/simllms-python
+        run: |
+          uv venv
+          uv pip install maturin
+          uv run --no-sync maturin sdist --out dist
+      - name: Name the artifacts
+        run: |
+          echo "SIMLLMS_CRATE=$(realpath target/package/simllms-*.crate)" >> "$GITHUB_ENV"
+          echo "SIMLLMS_SDIST=$(realpath crates/simllms-python/dist/simllms-*.tar.gz)" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: |
+            target/package/simllms-*.crate
+            crates/simllms-python/dist/simllms-*.tar.gz
+          if-no-files-found: error
+
+  inventory:
+    name: The artifact set is the intended set
+    needs: [verify, wheels, distributions]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          # Every artifact of this run into one flat directory. A check that
+          # compares a set cannot be given a sample of it.
+          path: dist
+          merge-multiple: true
+      - name: Every platform, and only those platforms
+        run: cargo xtask check-artifacts dist --tag "${{ needs.verify.outputs.tag }}"
+
+  seam:
+    name: The artifacts, in an environment that has never seen the source tree
+    needs: [verify, inventory]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Name the artifacts
+        # `realpath` fails on a glob that matched nothing, so an artifact that
+        # changed its name goes red here rather than skipping quietly later.
+        run: |
+          echo "SIMLLMS_CRATE=$(realpath dist/simllms-*.crate)" >> "$GITHUB_ENV"
+          echo "SIMLLMS_SDIST=$(realpath dist/simllms-*.tar.gz)" >> "$GITHUB_ENV"
+          echo "SIMLLMS_WHEEL=$(realpath dist/simllms-*-abi3-manylinux_2_28_x86_64.whl)" >> "$GITHUB_ENV"
+      - name: Install the wheel, and nothing else
+        # The test tools beside it, and no editable install: an import that
+        # resolved into `python/simllms` would be a test of this checkout called
+        # a test of the release.
+        run: |
+          uv venv
+          uv pip install "$SIMLLMS_WHEEL" pytest mypy
+      - name: The seam suite against the built artifacts
+        env:
+          SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        working-directory: crates/simllms-python
+        run: |
+          uv run --no-sync pytest tests -q > pytest.log 2>&1 || { cat pytest.log; exit 1; }
+          tail -n 2 pytest.log
+          grep -qE "[0-9]+ passed" pytest.log
+          # Every check in this file is a release check while a tag is being
+          # released, so a single skip here means the environment arrived
+          # half-built rather than that the release is fine.
+          ! grep -q "skipped" pytest.log
+      - name: mypy (pure-Python layer)
+        working-directory: crates/simllms-python
+        run: |
+          uv run --no-sync mypy python/simllms tests/test_client.py \
+            tests/test_package_inventory.py tests/test_release_artifacts.py
+
+  publish-python:
+    name: Publish the wheels and the sdist to PyPI
+    needs: [verify, inventory, seam]
+    runs-on: ubuntu-latest
+    environment: release
+    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # Trusted publishing: the runner's OIDC token is the credential, so no PyPI
+      # token lives in this repository. The publisher binding is configured on
+      # PyPI before the first tag reaches this job.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          path: dist
+          skip-existing: true
+
+  publish-crate:
+    name: Publish the crate to crates.io
+    needs: [verify, inventory, seam]
+    runs-on: ubuntu-latest
+    environment: release
+    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        # crates.io's trusted publishing reads this run's OIDC identity; the token
+        # here is deliberately absent, and the publisher binding is #21's setup.
+        run: cargo publish -p simllms

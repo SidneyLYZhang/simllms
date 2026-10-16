@@ -22,6 +22,7 @@ import os
 import re
 import tarfile
 import zipfile
+from collections.abc import Iterable
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
@@ -40,6 +41,17 @@ CARRIED = ("README.en.md", "CHANGELOG.md", *LICENSES)
 CROSS_PROVIDER_KEYWORD = "openai-compatible"
 CRATE_KEYWORDS = ("llm", CROSS_PROVIDER_KEYWORD, "deepseek", "moonshot", "qwen")
 CRATE_SOURCE_DIRS = ("src", "examples")
+# The whitelist names files, never a directory: cargo's `include` reaches into a
+# listed directory recursively and does not ask version control about it, so a
+# bare `src` would pack an ignored neighbour of the sources.
+CRATE_SOURCE_GLOBS = ("src/*.rs", "examples/*.rs")
+
+# What a working directory accumulates and a release has no business carrying.
+# The release job plants a marker inside each of these before packing, so the
+# assertion below is not a report that nothing happened to be there — it is a
+# report that the packagers kept what is definitely there out.
+WORKING_DIRECTORY_NAMES = ("target", "dist", "build", ".venv", "venv", "__pycache__", ".git")
+WORKING_DIRECTORY_SUFFIXES = (".pyc", ".pyo")
 
 # The one sentence both registries show, and the line only the English README
 # has: the summary must not name a provider, and the page must render English.
@@ -164,7 +176,7 @@ def test_the_packed_whitelist_promises_everything_the_release_has_to_carry(crate
     # drops one of these files goes red even when the archive was packed from a
     # directory that still holds it.
     include = toml_array(tar_contents(crate)["Cargo.toml"].decode("utf-8"), "include")
-    for required in (*CARRIED, *CRATE_SOURCE_DIRS):
+    for required in (*CARRIED, *CRATE_SOURCE_GLOBS):
         assert required in include, f"`[package] include` leaves out `{required}`"
 
 
@@ -230,6 +242,30 @@ def test_sdist_carries_every_file_it_declares(sdist: Path) -> None:
         assert required in files, f"the source distribution has no {required}"
     assert any(name.endswith("python/simllms/__init__.py") for name in files), sorted(files)
     assert any(name.endswith("Cargo.toml") for name in files), sorted(files)
+
+
+def holds_no_working_directory(names: Iterable[str]) -> list[str]:
+    return sorted(
+        name
+        for name in names
+        if any(segment in WORKING_DIRECTORY_NAMES for segment in name.split("/"))
+        or name.endswith(WORKING_DIRECTORY_SUFFIXES)
+    )
+
+
+def test_no_artifact_carries_a_working_directory(crate: Path, wheel: Path, sdist: Path) -> None:
+    """Ignored directories provably cannot enter, at any depth, in any archive.
+
+    The sdist embeds a copy of the core crate, so one marker under either crate
+    is enough to make this a release defect rather than a packaging curiosity.
+    """
+    offenders = holds_no_working_directory(tar_contents(crate))
+    assert offenders == [], f"the crate carries {offenders}"
+    offenders = holds_no_working_directory(tar_contents(sdist))
+    assert offenders == [], f"the source distribution carries {offenders}"
+    names, _ = wheel_contents(wheel)
+    offenders = holds_no_working_directory(names)
+    assert offenders == [], f"the wheel carries {offenders}"
 
 
 def test_the_copies_inside_the_artifacts_are_the_root_files(wheel: Path, crate: Path) -> None:

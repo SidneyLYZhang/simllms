@@ -36,6 +36,10 @@ jobs:
         # The guide's list is derived from client.rs minus lib.rs, so binding a
         # method without editing the guide, or renaming one, goes red here.
         run: cargo xtask check-docs
+      - name: The release line describes itself truthfully
+        # Checked on every pull request, not only when a tag exists: the release
+        # workflow is configuration, and configuration goes stale in a merge.
+        run: cargo xtask check-workflow
 
   python:
     name: Python tests
@@ -72,4 +76,6 @@ jobs:
         run: uv run --no-sync pytest tests
       - name: mypy (pure-Python layer)
         working-directory: crates/simllms-python
-        run: uv run --no-sync mypy python/simllms tests/test_client.py tests/test_package_inventory.py
+        run: |
+          uv run --no-sync mypy python/simllms tests/test_client.py \
+            tests/test_package_inventory.py tests/test_release_artifacts.py
