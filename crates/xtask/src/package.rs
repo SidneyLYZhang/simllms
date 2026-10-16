@@ -366,6 +366,47 @@ pub fn check_crate_listing(listing: &str, crate_manifest: &str) -> Vec<String> {
     problems
 }
 
+/// A carried file is read from inside the package directory, on a registry page
+/// where nothing else of the repository is nearby. So every link it holds has to
+/// be either absolute, an in-page anchor, or a sibling that travels with it.
+pub fn check_carried_links(text: &str, file: &str) -> Vec<String> {
+    link_targets(text)
+        .into_iter()
+        .filter(|target| {
+            !target.starts_with('#')
+                && !target.starts_with("http://")
+                && !target.starts_with("https://")
+                && !target.starts_with("mailto:")
+                && !CARRIED_FILES.iter().any(|sibling| *sibling == target)
+        })
+        .map(|target| {
+            format!(
+                "`{file}` links to `{target}`, which does not exist inside a packed package — \
+                 the copy is rendered from {CRATE_DIR} or {PYTHON_DIR}, so point it at the \
+                 repository URL instead"
+            )
+        })
+        .collect()
+}
+
+/// The targets of the markdown links in a document, in order.
+fn link_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("](") {
+        let after = &rest[at + 2..];
+        let Some(end) = after.find(')') else { break };
+        let raw = after[..end].trim();
+        let raw = raw
+            .strip_prefix('<')
+            .and_then(|wrapped| wrapped.strip_suffix('>'))
+            .unwrap_or(raw);
+        targets.push(raw.split_whitespace().next().unwrap_or(raw).to_string());
+        rest = &after[end + 1..];
+    }
+    targets
+}
+
 /// Does a whitelist entry bring `path` along? A directory entry covers its
 /// contents, and a `/**` suffix says the same thing louder.
 fn covers(patterns: &[String], path: &str) -> bool {
@@ -758,6 +799,32 @@ include = [
                  each package keeps — a package cannot reference a file above its own directory"
             );
         }
+    }
+
+    #[test]
+    fn a_relative_link_inside_a_carried_file_dangles_where_the_copy_lives() {
+        let text = "# simllms\n\n[guide](docs/getting-started.md), \
+                    [Chinese](README.md), [above](../CONTEXT.md)\n";
+        let problems = check_carried_links(text, "README.en.md");
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        for problem in &problems {
+            assert!(problem.contains("README.en.md"), "{problem}");
+            assert!(problem.contains("repository URL"), "{problem}");
+        }
+    }
+
+    #[test]
+    fn absolute_urls_anchors_and_traveling_siblings_pass() {
+        let text = "[docs](https://github.com/SidneyLYZhang/simllms/blob/main/docs/getting-started.md) \
+                    [mail](mailto:we@are.not.a.package) [top](#installation) \
+                    [notices](<THIRD-PARTY-NOTICES.md \"attribution obligation\">) \
+                    [changelog](CHANGELOG.md)\n";
+        assert_eq!(
+            check_carried_links(text, "README.en.md"),
+            Vec::<String>::new(),
+            "{:?}",
+            link_targets(text)
+        );
     }
 
     #[test]

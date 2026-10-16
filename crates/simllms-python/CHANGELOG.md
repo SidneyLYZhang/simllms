@@ -29,6 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sdist carries what PEP 639 demands, and no `__pycache__` leaks in. CI packs
   all three artifacts and names them to those checks, so a run that skipped
   them cannot report green.
+- Links inside the English README now point at the repository rather than at
+  repository paths. A registry page renders the copy that sits inside the
+  package, where `docs/getting-started.md` and `crates/…/examples/…` are not
+  there to be found — and `cargo xtask check-package` now refuses any carried
+  file that links to something which does not travel with it.
 
 ### Changed
 

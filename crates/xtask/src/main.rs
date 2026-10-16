@@ -88,6 +88,7 @@ fn check_package(args: impl Iterator<Item = String>) {
     let args: Vec<String> = args.collect();
     let mut problems = copy_problems();
     problems.extend(manifest_problems());
+    problems.extend(link_problems());
     if let Some(index) = args.iter().position(|arg| arg == "--crate-listing") {
         let listing = read_listing(args.get(index + 1).map(String::as_str));
         let manifest = read(&path(package::CRATE_MANIFEST));
@@ -97,6 +98,16 @@ fn check_package(args: impl Iterator<Item = String>) {
         problems,
         "packages carry their licenses, attribution and README",
     );
+}
+
+/// The links inside the root files that every package copies. A registry page
+/// renders those copies alone, so a link that only works from the repository
+/// root is broken for the people who never clone it.
+fn link_problems() -> Vec<String> {
+    package::CARRIED_FILES
+        .iter()
+        .flat_map(|file| package::check_carried_links(&read(&path(file)), file))
+        .collect()
 }
 
 /// The derived copies, judged against the files at the repository root.
