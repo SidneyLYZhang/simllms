@@ -171,6 +171,12 @@ pub fn check_gate_parity(ci: &str, release: &str) -> Vec<String> {
 /// teach the check to complain.
 const GATE_SHAPES: &[&str] = &["cargo test ", "cargo xtask ", "uv run --no-sync "];
 
+/// Commands that build rather than check, reached through a check's prefix
+/// (`uv run --no-sync maturin` produces the artifacts the S1 suite inspects). A
+/// packager is not a gate: counting one would demand the release line build with
+/// the same command it deliberately builds differently, through its own packagers.
+const BUILD_COMMANDS: &[&str] = &["maturin"];
+
 /// Every gate a workflow runs, in order, deduped. Comments are stripped first: a
 /// file that only *mentions* a gate in a comment does not run it. A step's own
 /// title is cut for the same reason — `- name: cargo xtask check-docs` describes
@@ -186,9 +192,11 @@ fn gates(text: &str) -> Vec<String> {
             while let Some(index) = rest.find(shape) {
                 rest = &rest[index + shape.len()..];
                 if let Some(word) = rest.split_whitespace().next() {
-                    let gate = format!("{shape}{word}");
-                    if !found.contains(&gate) {
-                        found.push(gate);
+                    if !BUILD_COMMANDS.contains(&word) {
+                        let gate = format!("{shape}{word}");
+                        if !found.contains(&gate) {
+                            found.push(gate);
+                        }
                     }
                 }
             }
@@ -882,6 +890,8 @@ jobs:
       - run: cargo xtask check-workflow
   python:
     steps:
+      - run: uv run --no-sync maturin build --out target/artifacts
+      - run: uv run --no-sync maturin sdist --out target/artifacts
       - run: uv run --no-sync pytest tests
       - run: uv run --no-sync mypy python/simllms tests/test_client.py
 "#;
@@ -1326,6 +1336,21 @@ jobs:
                 "`{gate}` must be required: {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_packager_behind_a_gate_is_not_a_gate() {
+        // The pull-request file builds the artifacts it inspects with
+        // `uv run --no-sync maturin`, while the release line builds them through
+        // maturin-action and `uv build`. Parity is about checks; demanding this
+        // would teach the rule to complain about a build it must not dictate.
+        assert!(gates(CI).contains(&"uv run --no-sync pytest".to_string()));
+        assert!(!gates(CI).iter().any(|gate| gate.contains("maturin")));
+        assert!(
+            check_gate_parity(CI, RELEASE).is_empty(),
+            "{:?}",
+            check_gate_parity(CI, RELEASE)
+        );
     }
 
     #[test]
