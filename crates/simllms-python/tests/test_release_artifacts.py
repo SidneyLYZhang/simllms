@@ -83,7 +83,8 @@ def module_file(module: object) -> Path:
 def test_the_installed_package_is_the_one_the_wheel_carried() -> None:
     assert module_file(simllms).parent.resolve() != SOURCE_PACKAGE, (
         "the tests are importing this checkout rather than the installed "
-        "distribution, so they would pass whatever the release shipped"
+        "distribution, so they would pass for any working tree and say nothing "
+        "about what was released"
     )
 
 

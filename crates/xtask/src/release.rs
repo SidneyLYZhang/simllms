@@ -20,6 +20,11 @@ pub const CHANGELOG: &str = "CHANGELOG.md";
 /// pinned base image that nothing verifies is a pin that drifts.
 pub const MANYLINUX: &str = "manylinux_2_28";
 
+/// The glibc number [`MANYLINUX`] promises, spelled the way a wheel's platform
+/// tag spells it. Held equal to `MANYLINUX` by a test rather than by a comment,
+/// because the two literals sit apart and only a check notices when one moves.
+pub const GLIBC_BASELINE: &str = "2_28";
+
 /// The platforms a release owes exactly one wheel to. `abi3` is why this is a
 /// platform list and not a platform-by-interpreter list: the one wheel in each
 /// row covers every interpreter the package supports.
@@ -74,8 +79,8 @@ pub fn check_tag(tag: &str) -> Vec<String> {
 }
 
 /// Does the tag name the version the repository declares? A tag ahead of the
-/// Authoritative Version publishes binaries that say something other than the
-/// number they were sold under; one behind it publishes a stale tree.
+/// Authoritative Version releases binaries that say something other than the
+/// number they were released under; one behind it releases a stale tree.
 pub fn check_tag_version(tag: &str, authoritative: &str) -> Vec<String> {
     let Some(version) = tag_version(tag) else {
         // `check_tag` has already named the shape; there is nothing to compare.
@@ -101,8 +106,9 @@ pub fn check_ancestor(tag: &str, ancestor_of_main: bool) -> Vec<String> {
     )]
 }
 
-/// The changelog has to say what this version is and when it shipped. A release
-/// without a dated section publishes an artifact that no history explains.
+/// The changelog has to say what this version is and when it was released. A
+/// release without a dated section hands out an artifact that no history
+/// explains.
 pub fn check_changelog(text: &str, version: &str) -> Vec<String> {
     let header = format!("## [{version}]");
     let Some(line) = text
@@ -165,11 +171,16 @@ pub fn check_gate_parity(ci: &str, release: &str) -> Vec<String> {
 /// teach the check to complain.
 const GATE_SHAPES: &[&str] = &["cargo test ", "cargo xtask ", "uv run --no-sync "];
 
-/// Every gate a workflow runs, in order, deduped. Comments are stripped first:
-/// a file that only *mentions* a gate in a comment does not run it.
+/// Every gate a workflow runs, in order, deduped. Comments are stripped first: a
+/// file that only *mentions* a gate in a comment does not run it. A step's own
+/// title is cut for the same reason — `- name: cargo xtask check-docs` describes
+/// a step and runs nothing.
 fn gates(text: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for line in code(text).lines() {
+        if line.starts_with("name:") || line.starts_with("- name:") {
+            continue;
+        }
         for shape in GATE_SHAPES {
             let mut rest = line;
             while let Some(index) = rest.find(shape) {
@@ -184,6 +195,44 @@ fn gates(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// The verdicts that decide whether a tag may be released, and the inputs the
+/// artifact seam is nothing without. They are named here because a rule that
+/// exists only as a function is a rule that never fires: `check-workflow` reads
+/// the workflow's shape, and a deleted step leaves a shape that is still valid.
+/// So the release line has to hold its own gates inside itself.
+pub fn check_invoked_gates(text: &str) -> Vec<String> {
+    const INVOKED: &[&str] = &["check-release", "check-artifacts"];
+    let mut problems = Vec::new();
+    let run = code(text);
+    for gate in INVOKED {
+        if !run.contains(&format!("cargo xtask {gate}")) {
+            problems.push(format!(
+                "`{RELEASE_WORKFLOW}` never runs `cargo xtask {gate}` — a rule nobody invokes cannot stop a Release, and the tag or the artifact set goes out ungated."
+            ));
+        }
+    }
+    // Assigned, not merely mentioned: a step that is only *called* by these names
+    // hands the seam nothing.
+    let assigned = |name: &str| {
+        run.lines()
+            .any(|line| line.contains(&format!("{name}:")) || line.contains(&format!("{name}=")))
+    };
+    if !assigned("SIMLLMS_RELEASE_TAG") {
+        problems.push(
+            format!("`{RELEASE_WORKFLOW}` never assigns `SIMLLMS_RELEASE_TAG`, so the seam suite has no tag to compare the artifacts against — every release assertion in it skips, and the run reports green having tested nothing."),
+        );
+    }
+    let installs_a_named_artifact = run
+        .lines()
+        .any(|line| line.contains("pip install") && line.contains("SIMLLMS_WHEEL"));
+    if !installs_a_named_artifact {
+        problems.push(format!(
+            "`{RELEASE_WORKFLOW}` installs no `$SIMLLMS_WHEEL`, so the seam suite imports this checkout rather than the artifact a Registry would hand out — name the wheel it downloads and install that."
+        ));
+    }
+    problems
 }
 
 /// What the workflow is allowed to be triggered by: a version tag, and a hand
@@ -272,14 +321,33 @@ pub fn check_matrix(text: &str) -> Vec<String> {
             ));
         }
     }
-    for image in values_of_key(text, "container") {
+    let images = values_of_key(text, "container");
+    let crossed = WHEEL_PLATFORMS
+        .iter()
+        .filter(|(label, _, _)| label.starts_with("manylinux"))
+        .count();
+    if images.len() < crossed {
+        problems.push(format!(
+            "`{RELEASE_WORKFLOW}` names {crossed} manylinux platforms but only {} base image{}, so a row builds inside whatever image the builder defaults to today — name the image for every manylinux row, or drop the row.",
+            images.len(),
+            if images.len() == 1 { "" } else { "s" }
+        ));
+    }
+    for image in images {
         let Some(tag) = image.rsplit(':').next().filter(|tag| !tag.is_empty()) else {
-            problems.push(format!("the container `{image}` carries no tag."));
+            problems.push(format!(
+                "the container `{image}` carries no tag — pin it to a dated release, as `{MANYLINUX}`'s own image is pinned, or the base moves under a build and takes the artifact with it."
+            ));
             continue;
         };
         if tag == "latest" || !image.contains('/') {
             problems.push(format!(
                 "the container `{image}` is not pinned — a base image that moves under the build moves the artifact, and the glibc baseline the release promises is then whatever the image decided today."
+            ));
+        }
+        if !image.contains(MANYLINUX) {
+            problems.push(format!(
+                "the container `{image}` names no `{MANYLINUX}` baseline, while `{MANYLINUX}` is what the wheel names are inspected against — a wheel built against one baseline and read as another is the mistake the pin exists to stop."
             ));
         }
     }
@@ -299,7 +367,9 @@ pub fn check_separation(text: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let jobs = mapping_keys(text, &["jobs"]);
     if jobs.is_empty() {
-        return vec![format!("`{RELEASE_WORKFLOW}` declares no jobs.")];
+        return vec![format!(
+            "`{RELEASE_WORKFLOW}` declares no jobs — the release line is a `jobs:` mapping with a build job and a publishing job in it."
+        )];
     }
     let mut publishers: Vec<&String> = Vec::new();
     for job in &jobs {
@@ -345,8 +415,8 @@ pub fn check_separation(text: &str) -> Vec<String> {
 
 /// The artifact names a run produced, judged against the intended set. Both
 /// directions fail: a missing platform is an incomplete release, and an extra is
-/// a wheel nobody agreed to ship — one that cannot be taken back once a registry
-/// has it.
+/// a wheel nobody agreed to release — one that cannot be taken back once a
+/// Registry has it.
 pub fn check_artifacts(names: &[String], version: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let mut wheels: Vec<(String, String)> = Vec::new();
@@ -372,7 +442,7 @@ pub fn check_artifacts(names: &[String], version: &str) -> Vec<String> {
                 ));
             }
             if let Some(baseline) = glibc_baseline(&platform) {
-                if baseline != "2_28" {
+                if baseline != GLIBC_BASELINE {
                     problems.push(format!(
                         "`{name}` is `{platform}`, a glibc baseline of {baseline} while the matrix pins `{MANYLINUX}`."
                     ));
@@ -692,7 +762,7 @@ on:
       dry_run:
         description: Build everything, publish nothing
         type: boolean
-        default: false
+        default: true
 
 jobs:
   verify:
@@ -744,7 +814,7 @@ jobs:
           args: --release --out dist
       - run: ls dist/*.whl | grep -q -- -abi3-
 
-  sdist:
+  distributions:
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -753,27 +823,29 @@ jobs:
       - run: maturin sdist --out dist
 
   inventory:
-    needs: [wheels, sdist]
+    needs: [verify, wheels, distributions]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
       - run: cargo xtask check-artifacts dist --tag "$GITHUB_REF_NAME"
 
   seam:
-    needs: inventory
+    needs: [verify, inventory]
     runs-on: ubuntu-latest
+    env:
+      SIMLLMS_CRATE: ${{ needs.inventory.outputs.crate }}
+      SIMLLMS_SDIST: ${{ needs.inventory.outputs.sdist }}
+      SIMLLMS_WHEEL: ${{ needs.inventory.outputs.wheel }}
+      SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
       - run: uv pip install "$SIMLLMS_WHEEL" pytest mypy
       - run: uv run --no-sync pytest tests
       - run: uv run --no-sync mypy python/simllms tests
 
   publish-python:
-    needs: [inventory, seam]
+    needs: [verify, inventory, seam]
     runs-on: ubuntu-latest
     environment: release
     if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
@@ -787,7 +859,7 @@ jobs:
           skip-existing: true
 
   publish-crate:
-    needs: [inventory, seam]
+    needs: [verify, inventory, seam]
     runs-on: ubuntu-latest
     environment: release
     if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
@@ -1080,7 +1152,7 @@ jobs:
     fn a_rehearsal_is_asked_for_by_name_and_a_tag_is_never_an_input() {
         assert!(check_dispatch(RELEASE).is_empty());
         let no_inputs = RELEASE.replace(
-            "    inputs:\n      dry_run:\n        description: Build everything, publish nothing\n        type: boolean\n        default: false\n",
+            "    inputs:\n      dry_run:\n        description: Build everything, publish nothing\n        type: boolean\n        default: true\n",
             "",
         );
         let problems = check_dispatch(&no_inputs);
@@ -1142,7 +1214,7 @@ jobs:
     #[test]
     fn a_publisher_that_computes_instead_of_consuming_artifacts_is_named() {
         let merged = RELEASE.replace(
-            "  publish-crate:\n    needs: [inventory, seam]\n    runs-on: ubuntu-latest\n    environment: release\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
+            "  publish-crate:\n    needs: [verify, inventory, seam]\n    runs-on: ubuntu-latest\n    environment: release\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
             "  publish-crate:\n    runs-on: ubuntu-latest\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
         );
         let problems = check_separation(&merged);
@@ -1257,6 +1329,111 @@ jobs:
     }
 
     #[test]
+    fn a_step_titled_as_a_gate_does_not_run_it() {
+        // `code()` keeps `- name:` lines, because a name is not a comment; were
+        // the scan satisfied by one, a step could claim a gate it never runs.
+        let titled = RELEASE.replace(
+            "      - run: cargo xtask check-docs\n",
+            "      - name: cargo xtask check-docs\n        run: echo ok\n",
+        );
+        let problems = check_gate_parity(CI, &titled);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("cargo xtask check-docs")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_release_line_runs_its_own_verdicts() {
+        assert!(check_invoked_gates(RELEASE).is_empty());
+
+        // Deleting a step leaves a file that is still well-formed, so parity with
+        // the pull-request gate cannot notice: the tag would go out ungated by a
+        // rule that exists only as a function nobody calls.
+        let ungated = RELEASE.replace(
+            "      - run: cargo xtask check-release \"$GITHUB_REF_NAME\"\n",
+            "",
+        );
+        let problems = check_invoked_gates(&ungated);
+        assert!(
+            problems.iter().any(|p| p.contains("check-release")),
+            "{problems:?}"
+        );
+
+        let uninspected = RELEASE.replace(
+            "      - run: cargo xtask check-artifacts dist --tag \"$GITHUB_REF_NAME\"\n",
+            "",
+        );
+        let problems = check_invoked_gates(&uninspected);
+        assert!(
+            problems.iter().any(|p| p.contains("check-artifacts")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_seam_without_its_tag_or_its_wheel_tests_nothing() {
+        // Both absence paths are silent: no tag means every release assertion
+        // skips, and no named wheel means the import resolves into this checkout.
+        let untagged = RELEASE.replace(
+            "      SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}\n",
+            "",
+        );
+        let problems = check_invoked_gates(&untagged);
+        assert!(
+            problems.iter().any(|p| p.contains("SIMLLMS_RELEASE_TAG")),
+            "{problems:?}"
+        );
+
+        let source_installed =
+            RELEASE.replace("uv pip install \"$SIMLLMS_WHEEL\"", "uv pip install .");
+        let problems = check_invoked_gates(&source_installed);
+        assert!(
+            problems.iter().any(|p| p.contains("SIMLLMS_WHEEL")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_manylinux_row_with_no_named_image_is_a_row_with_no_baseline() {
+        // Both manylinux rows name an image. Drop one image and the row is still
+        // syntactically fine — it just builds inside the builder's default, and
+        // the wheel would carry a baseline nobody wrote down.
+        let defaulted = RELEASE.replace(
+            "            container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64\n",
+            "",
+        );
+        let problems = check_matrix(&defaulted);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("manylinux platforms but only 1 base image")),
+            "{problems:?}"
+        );
+
+        let off_baseline = RELEASE.replace(
+            "container: quay.io/pypa/manylinux_2_28_x86_64:2026.10.10-1",
+            "container: quay.io/pypa/manylinux_2_34_x86_64:2026.10.10-1",
+        );
+        let problems = check_matrix(&off_baseline);
+        assert!(
+            problems.iter().any(|p| p.contains(MANYLINUX)),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_pinned_baseline_and_the_inspected_wheel_tag_are_one_number() {
+        // `MANYLINUX` is what the workflow has to name and `GLIBC_BASELINE` is
+        // what a wheel's platform tag has to carry. Two literals kept equal only
+        // by a comment drift, so this is the thing that holds them.
+        assert!(MANYLINUX.ends_with(GLIBC_BASELINE));
+        assert_eq!(GLIBC_BASELINE, "2_28");
+    }
+
+    #[test]
     fn a_comment_never_satisfies_a_rule_about_what_a_release_does() {
         let commented = RELEASE.replace(
             "      - run: cargo xtask check-docs\n",
@@ -1284,7 +1461,7 @@ jobs:
             vec![
                 "verify",
                 "wheels",
-                "sdist",
+                "distributions",
                 "inventory",
                 "seam",
                 "publish-python",
@@ -1301,7 +1478,11 @@ jobs:
         );
         assert_eq!(
             scalar(RELEASE, &["jobs", "publish-crate"], "needs"),
-            vec!["inventory".to_string(), "seam".to_string()]
+            vec![
+                "verify".to_string(),
+                "inventory".to_string(),
+                "seam".to_string()
+            ]
         );
         assert_eq!(
             scalar(RELEASE, &["jobs", "publish-python"], "environment"),

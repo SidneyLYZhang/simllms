@@ -53,9 +53,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `cargo xtask check-workflow` reads the release file and holds it to itself: the
   triggers, the pinned base images, the absence of an emulator, one abi3 wheel
   per platform, build and publish as separate jobs joined by artifacts, and every
-  gate the pull-request path runs. `cargo xtask check-artifacts <dir> --tag <tag>`
-  compares a built artifact set against the intended platforms, so a missing
-  platform and an unexpected extra both go red.
+  gate the pull-request path runs. It also requires the release file to *run* the
+  verdicts that decide a release — `check-release` and `check-artifacts` — and to
+  hand the seam its tag and its wheel, because a deleted step leaves a file that
+  is still well-formed and a rule nobody invokes stops nothing.
+  `cargo xtask check-artifacts <dir> --tag <tag>` compares a built artifact set
+  against the intended platforms, so a missing platform and an unexpected extra
+  both go red.
 - `crates/simllms-python/tests/test_release_artifacts.py` runs against an
   installed wheel in a venv that never saw the checkout: the reported version is
   the tag's, the version comes out of the compiled extension, the licenses and
@@ -72,7 +76,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sources — a stray `src/__pycache__/` or an editor's backup. `check-package`
   refuses a directory entry, and the release job plants a marker inside every
   ignored directory before packing, so the artifact checks prove it stayed out.
-
 - The Python distribution declares `license = "MIT OR Apache-2.0"` as an SPDX
   expression with `license-files` (PEP 639, `Metadata-Version: 2.4`) instead
   of a `License ::` classifier, which PyPI deprecated. The wheels are built

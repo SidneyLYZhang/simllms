@@ -286,4 +286,10 @@ jobs:
       - name: Publish
         # crates.io's trusted publishing reads this run's OIDC identity; the token
         # here is deliberately absent, and the publisher binding is #21's setup.
+        #
+        # This is the one half of the release that repacks rather than uploading the
+        # inspected `.crate`: cargo has no path that publishes a file, only a tree.
+        # What stands in for the artifact is `verify`, which packs the same tree the
+        # same way and is held to it twice — `check-package` against the packager's
+        # own listing, and a `--dry-run` that compiles what it listed.
         run: cargo publish -p simllms

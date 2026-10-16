@@ -93,5 +93,17 @@ The public index a Release is made available on: crates.io for the crate, PyPI f
 _Avoid_: Catalog, marketplace
 
 **Forward Fix**:
-Repairing a half-failed Release by cutting the next number, not by removing what already shipped. Registries keep old numbers forever; we do not undo them.
+Repairing a half-failed Release by cutting the next number, not by removing what was already released. Registries keep old numbers forever; we do not undo them.
 _Avoid_: Rollback, yank
+
+**Release line**:
+The whole path one Release rides, from the tag to both Registries: the verdicts on the tag, the builds, the inspection of what was built, and the publication behind an approval. One line, run either for real or in rehearsal.
+_Avoid_: Pipeline, CI, workflow
+
+**Rehearsal**:
+Running the Release line end to end and releasing nothing, so the first real Release rides a path that has already been taken. It asks for the number the tag would have to carry rather than naming a tag of its own.
+_Avoid_: Dry run, smoke test, dress rehearsal
+
+**Intended platform set**:
+The platforms a Release owes exactly one wheel to. A wheel outside it is a decision nobody made, and a missing one is an incomplete Release; both are refused, not warned about.
+_Avoid_: Supported platforms, matrix

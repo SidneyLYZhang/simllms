@@ -244,7 +244,7 @@ def test_sdist_carries_every_file_it_declares(sdist: Path) -> None:
     assert any(name.endswith("Cargo.toml") for name in files), sorted(files)
 
 
-def holds_no_working_directory(names: Iterable[str]) -> list[str]:
+def working_directories_inside(names: Iterable[str]) -> list[str]:
     return sorted(
         name
         for name in names
@@ -259,12 +259,12 @@ def test_no_artifact_carries_a_working_directory(crate: Path, wheel: Path, sdist
     The sdist embeds a copy of the core crate, so one marker under either crate
     is enough to make this a release defect rather than a packaging curiosity.
     """
-    offenders = holds_no_working_directory(tar_contents(crate))
+    offenders = working_directories_inside(tar_contents(crate))
     assert offenders == [], f"the crate carries {offenders}"
-    offenders = holds_no_working_directory(tar_contents(sdist))
+    offenders = working_directories_inside(tar_contents(sdist))
     assert offenders == [], f"the source distribution carries {offenders}"
     names, _ = wheel_contents(wheel)
-    offenders = holds_no_working_directory(names)
+    offenders = working_directories_inside(names)
     assert offenders == [], f"the wheel carries {offenders}"
 
 

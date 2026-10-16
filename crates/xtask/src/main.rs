@@ -60,15 +60,20 @@ fn main() {
     }
 }
 
+/// The Authoritative Version, read from the root manifest. Deriving the tag a
+/// tree would deserve and checking the tag a run was given are two commands over
+/// the same number.
+fn authoritative_version() -> String {
+    let root_manifest = read(&path(version::ROOT_MANIFEST));
+    version::authoritative_version(&root_manifest).unwrap_or_else(|problem| panic!("{problem}"))
+}
+
 /// The tag this tree would be released under, on stdout: `v` and the Authoritative
 /// Version. A dry-run dispatch has no tag to read, and the number a tag would have
 /// to carry is the one the workspace already declares — so the derivation stays
 /// here rather than becoming a shell `grep` of `Cargo.toml`.
 fn release_tag() {
-    let root_manifest = read(&path(version::ROOT_MANIFEST));
-    let authoritative = version::authoritative_version(&root_manifest)
-        .unwrap_or_else(|problem| panic!("{problem}"));
-    println!("v{authoritative}");
+    println!("v{}", authoritative_version());
 }
 
 /// Is this tag allowed to become a release? Every rule is named by the check that
@@ -81,9 +86,7 @@ fn check_release(args: impl Iterator<Item = String>) {
         std::process::exit(2);
     };
     let commit = arg_after(&args, "--commit").unwrap_or_else(|| "HEAD".to_string());
-    let root_manifest = read(&path(version::ROOT_MANIFEST));
-    let authoritative = version::authoritative_version(&root_manifest)
-        .unwrap_or_else(|problem| panic!("{problem}"));
+    let authoritative = authoritative_version();
     let changelog = read(&path(release::CHANGELOG));
 
     let mut problems = release::check_tag(tag);
@@ -134,7 +137,9 @@ fn check_artifacts(args: impl Iterator<Item = String>) {
         std::process::exit(2);
     };
     let Some(version) = release::tag_version(&tag) else {
-        eprintln!("`{tag}` is not a release tag, so nothing can be compared to it.");
+        eprintln!(
+            "`{tag}` is not a release tag, so nothing here can be compared to it — pass `--tag` in `vX.Y.Z`, the number `cargo xtask release-tag` derives."
+        );
         std::process::exit(1);
     };
     let entries = fs::read_dir(path(directory)).unwrap_or_else(|e| {
@@ -173,6 +178,7 @@ fn check_workflow() {
             problems.extend(release::check_matrix(&text));
             problems.extend(release::check_separation(&text));
             problems.extend(release::check_gate_parity(&ci, &text));
+            problems.extend(release::check_invoked_gates(&text));
             problems
         }
     };
