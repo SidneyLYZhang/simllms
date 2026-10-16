@@ -52,6 +52,10 @@ cargo add simllms
 pip install simllms   # or: uv add simllms
 ```
 
+本版 Python 尚未绑定全部客户端入口，清单见
+[快速开始](docs/getting-started.md)的「Rust-only for now」一节；Python 覆盖会在
+后续 minor 版本补齐。
+
 文档：[docs/getting-started.md](docs/getting-started.md) ·
 主题指南在 `docs/` 下（chat / streaming / structured-output /
 image-generation / capabilities / custom-gateway）。

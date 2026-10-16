@@ -23,17 +23,18 @@ let client = Client::new(Provider::Custom, "my-gateway-model", "sk-...")
 ```
 
 默认鉴权是 `Authorization: Bearer <key>`；网关用别的头时用 `Auth::Header`
-（或 Python 侧等价物）。额外的固定请求头走客户端级 `default_headers`。
+（`with_auth`，本版仅 Rust）。额外的固定请求头走客户端级 `default_headers`
+（`with_default_header`，同样本版仅 Rust）。
 
 ## 网关模型与能力门（ADR-0005）
 
 网关上的模型 id 不会出现在 simllms 目录里，所以它们是 warn-and-pass：
-请求照发、警告可预览。要让门认真把关，两条路：
+请求照发（Rust 侧还能先预览那条警告）。要让门认真把关，两条路：
 
 1. **声明覆盖**：`capability_overrides={"image_input": False, ...}`——
    之后违规请求在本地被拒。
-2. **提供商列表**：`Custom` 没有机读列表约定，`refresh_models()` 会明确
-   报错（绝不猜测）；目录 + 覆盖是仅有的两个能力来源。
+2. **提供商列表**：`Custom` 没有机读列表约定，`refresh_models()`（本版仅
+   Rust）会明确报错（绝不猜测）；目录 + 覆盖是仅有的两个能力来源。
 
 ## 请求体检 / debug_request
 

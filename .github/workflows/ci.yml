@@ -23,6 +23,12 @@ jobs:
         run: cargo test --workspace
       - name: Generated catalog is in sync
         run: cargo xtask refresh-catalog --check
+      - name: Authoritative Version is derived everywhere
+        run: cargo xtask sync-version --check
+      - name: Rust-only entry-point list matches the bindings
+        # The guide's list is derived from client.rs minus lib.rs, so binding a
+        # method without editing the guide, or renaming one, goes red here.
+        run: cargo xtask check-docs
 
   python:
     name: Python tests

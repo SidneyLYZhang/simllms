@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+mod docs;
+mod version;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 const API_URL: &str = "https://models.dev/api.json";
@@ -27,16 +30,91 @@ fn main() {
             let check = std::env::args().nth(2).as_deref() == Some("--check");
             refresh_catalog(check);
         }
+        Some("sync-version") => {
+            let check = std::env::args().nth(2).as_deref() == Some("--check");
+            sync_version(check);
+        }
+        Some("check-docs") => check_docs(),
         _ => {
-            eprintln!("usage: cargo xtask refresh-catalog [--check]");
+            eprintln!(
+                "usage: cargo xtask refresh-catalog [--check] | sync-version [--check] | check-docs"
+            );
             std::process::exit(2);
         }
     }
 }
 
+/// The guide's Rust-only list must equal the gap between what the core Client
+/// offers and what the binding layer reaches.
+fn check_docs() {
+    let core = read(&path(docs::CORE_CLIENT));
+    let bindings = read(&path(docs::BINDINGS));
+    let guide = read(&path(docs::GUIDE));
+
+    let problems = docs::check(&core, &bindings, &guide);
+    if problems.is_empty() {
+        println!("the guide's Rust-only list matches the code");
+        return;
+    }
+    for problem in &problems {
+        eprintln!("{problem}");
+    }
+    std::process::exit(1);
+}
+
+/// The Authoritative Version lives in the root workspace manifest; the binding
+/// crate is its only written copy. Nothing here reads a tag or rewrites the
+/// repository's own declaration — a human changes the source and the diff shows it.
+fn sync_version(check: bool) {
+    let binding_path = path(version::BINDING_MANIFEST);
+    let root_manifest = read(&path(version::ROOT_MANIFEST));
+    let binding_manifest = read(&binding_path);
+    let pyproject = read(&path(version::PYPROJECT));
+    let python_init = read(&path(version::PYTHON_INIT));
+
+    // A version we cannot read must not be propagated; `inspect` below is what
+    // names why, so dropping it here defers the report rather than swallowing it.
+    let derived = version::authoritative_version(&root_manifest)
+        .ok()
+        .and_then(|v| version::render_derived(&binding_manifest, &v).ok());
+
+    // `--check` judges what is on disk, so a stale derived copy is named rather
+    // than quietly repaired; only a write run replaces it.
+    let effective = match derived {
+        Some(rendered) if !check && rendered != binding_manifest => {
+            fs::write(&binding_path, &rendered).expect("write the binding crate's manifest");
+            println!(
+                "derived {} from the Authoritative Version",
+                version::BINDING_MANIFEST
+            );
+            rendered
+        }
+        _ => binding_manifest,
+    };
+
+    let problems = version::inspect(&root_manifest, &effective, &pyproject, &python_init);
+    if problems.is_empty() {
+        println!("versions are consistent");
+        return;
+    }
+    for problem in &problems {
+        eprintln!("{problem}");
+    }
+    std::process::exit(1);
+}
+
+fn path(relative: &str) -> PathBuf {
+    PathBuf::from(ROOT).join(relative)
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {} (run from the repository root): {e}", path.display()))
+}
+
 fn refresh_catalog(check: bool) {
-    let snapshot_path = PathBuf::from(ROOT).join("catalog/modelsdev-snapshot.json");
-    let data_path = PathBuf::from(ROOT).join("crates/simllms/src/catalog_data.rs");
+    let snapshot_path = path("catalog/modelsdev-snapshot.json");
+    let data_path = path("crates/simllms/src/catalog_data.rs");
 
     if check {
         // Offline consistency: the generated code must match the vendored

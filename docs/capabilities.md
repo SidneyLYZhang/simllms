@@ -21,7 +21,7 @@ status                Active / Deprecated
 1. **目录（Catalog）**：随包内置的 models.dev 过滤快照（515 条），
    由 `cargo xtask refresh-catalog` 离线生成、每周自动提 PR 更新——
    目录变更永远经人审，绝不静默改变行为。
-2. **提供商自述（Provider）**：显式调用 `refresh_models()` 拉取
+2. **提供商自述（Provider）**：显式调用 `refresh_models()`（本版仅 Rust）拉取
    DeepSeek / Moonshot / DashScope / OpenRouter 的模型列表并按字段合并
    （列表确认存在、明说的字段覆盖目录、没说的继承目录）。Zhipu / MiMo
    没有机读列表，仅目录 + 用户覆盖。
@@ -33,10 +33,14 @@ status                Active / Deprecated
 不在任何来源里的模型 id **不会被拒绝**（ADR-0005）——请求照发，同时
 产生警告。这保证新模型上线第一天就能用：
 
-```python
-client.warnings(["hi"], {})        # 预览警告，不发请求
-client.refresh_models()             # 一次显式调用后，未知 → Known（Source::Provider）
+```rust
+client.warnings(&messages, &options);   // 预览警告，不发请求
+client.refresh_models().await?;         // 一次显式调用后，未知 → Known（Source::Provider）
 ```
+
+这两个入口本版只在 Rust 侧可用：Python 里未知模型同样是 warn-and-pass、请求
+照发，只是暂时读不到那条结构化警告。清单见
+[快速开始](getting-started.md)的 Rust-only 一节。
 
 ## 覆盖示例
 

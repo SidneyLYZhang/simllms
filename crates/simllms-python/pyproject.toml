@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "simllms"
-version = "0.1.0"
+# The Authoritative Version is the root workspace manifest; this copy derives
+# through the binding crate's Cargo.toml, which the build backend reads.
+dynamic = ["version"]
 description = "Unified client for multiple LLM providers"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }

@@ -578,6 +578,7 @@ impl Client {
 
 #[pymodule(name = "_core")]
 fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SimLLMError", m.py().get_type::<SimLLMError>())?;
     m.add("CapabilityError", m.py().get_type::<CapabilityError>())?;
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;

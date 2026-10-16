@@ -7,6 +7,8 @@ suggestions on CapabilityError; status/provider_message/raw_body on APIError).
 
 from typing import Any, Iterator, Sequence
 
+__version__: str
+
 
 class SimLLMError(Exception): ...
 

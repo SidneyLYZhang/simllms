@@ -59,6 +59,11 @@ cargo add simllms
 pip install simllms   # or: uv add simllms
 ```
 
+This release does not bind every client entry point on the Python side; the
+list is in the "Rust-only for now" section of
+[docs/getting-started.md](docs/getting-started.md), and Python coverage lands
+in a later minor release.
+
 Docs: [docs/getting-started.md](docs/getting-started.md) ·
 topic guides live under `docs/` (chat / streaming / structured-output /
 image-generation / capabilities / custom-gateway).

@@ -42,7 +42,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.1.0"
+__version__ = _core.__version__
 
 LOGGER_NAME = "simllms"
 logger = logging.getLogger(LOGGER_NAME)
