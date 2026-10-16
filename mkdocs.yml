@@ -36,6 +36,7 @@ nav:
   - 图像生成: image-generation.md
   - 能力门: capabilities.md
   - 自定义网关: custom-gateway.md
+  - 路线图: roadmap.md
   - 变更日志: changelog.md
   - 架构决策 / ADR:
       - 0001: adr/0001-core-crate-never-links-python.md

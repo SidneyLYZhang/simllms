@@ -77,3 +77,17 @@ _Avoid_: Stats, metrics, billing
 **Image Generation**:
 Producing an image from a prompt. Distinct from Chat: different providers, different endpoints, some of which complete asynchronously behind the scenes.
 _Avoid_: Plot, drawing, text2image
+
+### Releasing
+
+**Release**:
+One act that freezes current code plus one Catalog Snapshot into the same version number on both registries. Rust and Python never release apart.
+_Avoid_: Publish, deploy, ship
+
+**Authoritative Version**:
+The single place that decides a Release's number — the workspace version in the root `Cargo.toml`. Every other version in the tree is a derived copy.
+_Avoid_: Master version, canonical version
+
+**Forward Fix**:
+Repairing a half-failed Release by cutting the next number, not by removing what already shipped. Registries keep old numbers forever; we do not undo them.
+_Avoid_: Rollback, yank
