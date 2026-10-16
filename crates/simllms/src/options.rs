@@ -71,6 +71,12 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let o = Options::default();
-        assert_eq!(o, Options { extra: Map::new(), ..Default::default() });
+        assert_eq!(
+            o,
+            Options {
+                extra: Map::new(),
+                ..Default::default()
+            }
+        );
     }
 }

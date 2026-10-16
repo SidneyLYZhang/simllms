@@ -62,7 +62,11 @@ fn next_event(buffer: &mut Vec<u8>) -> Option<SseEvent> {
 /// (a lone `\r\r` also counts, defensively). Returns (event end, delimiter len).
 fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
-    for (pat, len) in [(&b"\n\n"[..], 2usize), (&b"\r\n\r\n"[..], 4usize), (&b"\r\r"[..], 2usize)] {
+    for (pat, len) in [
+        (&b"\n\n"[..], 2usize),
+        (&b"\r\n\r\n"[..], 4usize),
+        (&b"\r\r"[..], 2usize),
+    ] {
         if let Some(pos) = find_sub(buf, pat) {
             if best.is_none() || pos < best.unwrap().0 {
                 best = Some((pos, len));
@@ -109,9 +113,13 @@ fn parse_chunk(data: &str) -> Result<Chunk, Error> {
             .or_else(|| d.get("reasoning"))
             .and_then(|t| t.as_str());
         if let Some(r) = reasoning {
-            Some(Delta::Reasoning { text: r.to_string() })
+            Some(Delta::Reasoning {
+                text: r.to_string(),
+            })
         } else if let Some(t) = text {
-            Some(Delta::Text { text: t.to_string() })
+            Some(Delta::Text {
+                text: t.to_string(),
+            })
         } else {
             None
         }
@@ -126,7 +134,10 @@ fn parse_chunk(data: &str) -> Result<Chunk, Error> {
     });
 
     Ok(Chunk {
-        index: choice.and_then(|c| c.get("index")).and_then(|i| i.as_u64()).unwrap_or(0),
+        index: choice
+            .and_then(|c| c.get("index"))
+            .and_then(|i| i.as_u64())
+            .unwrap_or(0),
         delta: chunk_delta,
         finish_reason: choice
             .and_then(|c| c.get("finish_reason"))
@@ -184,9 +195,15 @@ impl ChatStream {
     fn timeout_error(&self) -> Error {
         Error::Transport(TransportError {
             message: if self.got_first {
-                format!("no stream event within idle timeout of {:?}", self.idle_timeout)
+                format!(
+                    "no stream event within idle timeout of {:?}",
+                    self.idle_timeout
+                )
             } else {
-                format!("no first stream event within timeout of {:?}", self.first_token_timeout)
+                format!(
+                    "no first stream event within timeout of {:?}",
+                    self.first_token_timeout
+                )
             },
         })
     }
@@ -290,7 +307,8 @@ mod tests {
 
     #[test]
     fn handles_crlf_and_comments_and_multiline_data() {
-        let body = ": keep-alive\r\nevent: delta\r\ndata: {\"x\":\r\ndata: 1}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let body =
+            ": keep-alive\r\nevent: delta\r\ndata: {\"x\":\r\ndata: 1}\r\n\r\ndata: [DONE]\r\n\r\n";
         let events = drain_events(body);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], SseEvent::Data(d) if d == "{\"x\":\n1}"));
@@ -311,8 +329,16 @@ mod tests {
         assert_eq!(text.index, 3);
         assert_eq!(text.delta, Some(Delta::Text { text: "hi".into() }));
 
-        let reasoning = parse_chunk("{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}],\"usage\":null}").unwrap();
-        assert_eq!(reasoning.delta, Some(Delta::Reasoning { text: "thinking".into() }));
+        let reasoning = parse_chunk(
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}],\"usage\":null}",
+        )
+        .unwrap();
+        assert_eq!(
+            reasoning.delta,
+            Some(Delta::Reasoning {
+                text: "thinking".into()
+            })
+        );
 
         let final_chunk = parse_chunk(
             "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9,\"total_tokens\":16}}",

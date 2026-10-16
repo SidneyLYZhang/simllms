@@ -13,3 +13,4 @@ dist/
 # LLM
 agents/
 /.scratch/
+AGENTS.md

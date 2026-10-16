@@ -38,7 +38,10 @@ async fn main() {
                 .await
                 .expect("mock chat failed");
             mock.assert();
-            println!("{} (against the local mock server — set DEEPSEEK_API_KEY to go live)", reply.content);
+            println!(
+                "{} (against the local mock server — set DEEPSEEK_API_KEY to go live)",
+                reply.content
+            );
             println!("[usage] {:?}", reply.usage);
         }
     }

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 
 pub(crate) const SNAPSHOT_COMMIT: &str = "5ad99719fd79075d1afb5aa99a30f80c7e1f7eb5";
 
+#[rustfmt::skip]
 fn mk(
     input: &[Modality],
     structured_output: bool,
@@ -29,6 +30,7 @@ fn mk(
     }
 }
 
+#[rustfmt::skip]
 pub(crate) fn entries() -> Vec<(Provider, &'static str, Capabilities)> {
     vec![
         (Provider::DeepSeek, "deepseek-flash", mk(

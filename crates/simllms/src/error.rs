@@ -29,7 +29,11 @@ impl std::fmt::Display for CapabilityError {
             self.model, self.missing
         )?;
         if !self.suggestions.is_empty() {
-            write!(f, "; capable models on this provider: {}", self.suggestions.join(", "))?;
+            write!(
+                f,
+                "; capable models on this provider: {}",
+                self.suggestions.join(", ")
+            )?;
         }
         Ok(())
     }
@@ -37,7 +41,11 @@ impl std::fmt::Display for CapabilityError {
 
 impl CapabilityError {
     pub fn without_suggestions(model: impl Into<String>, missing: MissingCapability) -> Self {
-        CapabilityError { model: model.into(), missing, suggestions: Vec::new() }
+        CapabilityError {
+            model: model.into(),
+            missing,
+            suggestions: Vec::new(),
+        }
     }
 }
 
@@ -97,7 +105,11 @@ mod tests {
     use super::*;
 
     fn api(status: u16) -> Error {
-        Error::Api(ApiError { status, provider_message: String::new(), raw_body: String::new() })
+        Error::Api(ApiError {
+            status,
+            provider_message: String::new(),
+            raw_body: String::new(),
+        })
     }
 
     #[test]
@@ -108,12 +120,19 @@ mod tests {
         assert!(!api(400).is_retryable());
         assert!(!api(401).is_retryable());
         assert!(!api(404).is_retryable());
-        assert!(Error::Transport(TransportError { message: "x".into() }).is_retryable());
-        assert!(!Error::Capability(CapabilityError {
-            model: "m".into(),
-            missing: MissingCapability::ImageInput,
-            suggestions: Vec::new(),
-        })
-        .is_retryable());
+        assert!(
+            Error::Transport(TransportError {
+                message: "x".into()
+            })
+            .is_retryable()
+        );
+        assert!(
+            !Error::Capability(CapabilityError {
+                model: "m".into(),
+                missing: MissingCapability::ImageInput,
+                suggestions: Vec::new(),
+            })
+            .is_retryable()
+        );
     }
 }

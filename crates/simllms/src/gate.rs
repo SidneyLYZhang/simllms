@@ -12,12 +12,18 @@ pub struct ChatRequest {
 
 impl ChatRequest {
     pub fn text(messages: Vec<Message>, options: Options) -> Self {
-        ChatRequest { messages, options, stream: false }
+        ChatRequest {
+            messages,
+            options,
+            stream: false,
+        }
     }
 
     fn has_image_input(&self) -> bool {
         self.messages.iter().any(|m: &Message| {
-            m.content.iter().any(|b| matches!(b, ContentBlock::Image(_)))
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_)))
         })
     }
 }
@@ -57,7 +63,9 @@ pub fn gate(
 
     let mut warnings = Vec::new();
     if caps.status == crate::capabilities::ModelStatus::Deprecated {
-        warnings.push(Warning::DeprecatedModel { model: model.to_string() });
+        warnings.push(Warning::DeprecatedModel {
+            model: model.to_string(),
+        });
     }
 
     check(caps, request, model)?;
@@ -82,7 +90,9 @@ fn check(caps: &Capabilities, request: &ChatRequest, model: &str) -> Result<(), 
             missing: MissingCapability::StructuredOutput,
         }));
     }
-    if request.options.reasoning_enabled == Some(true) && caps.reasoning == crate::capabilities::ReasoningMode::None {
+    if request.options.reasoning_enabled == Some(true)
+        && caps.reasoning == crate::capabilities::ReasoningMode::None
+    {
         return Err(Error::Capability(CapabilityError {
             model: model_id,
             suggestions: Vec::new(),
@@ -104,9 +114,7 @@ fn check(caps: &Capabilities, request: &ChatRequest, model: &str) -> Result<(), 
     ) && max_tokens > cap
     {
         return Err(Error::Config(ConfigError {
-            message: format!(
-                "max_tokens {max_tokens} exceeds the model's max output of {cap}"
-            ),
+            message: format!("max_tokens {max_tokens} exceeds the model's max output of {cap}"),
         }));
     }
     Ok(())
@@ -140,7 +148,10 @@ mod tests {
 
     fn vision_model() -> Capabilities {
         Capabilities {
-            input_modalities: BTreeSet::from([crate::capabilities::Modality::Text, crate::capabilities::Modality::Image]),
+            input_modalities: BTreeSet::from([
+                crate::capabilities::Modality::Text,
+                crate::capabilities::Modality::Image,
+            ]),
             structured_output: true,
             tool_call: true,
             ..Capabilities::text_only(Source::Catalog)
@@ -150,8 +161,13 @@ mod tests {
     #[test]
     fn image_to_text_only_model_is_refused_locally() {
         let caps = ResolvedCapabilities::Known(Capabilities::text_only(Source::Catalog));
-        let err = gate(&caps, &image_request(), Provider::DeepSeek, "deepseek-v4-pro")
-            .expect_err("image input must fail the Gate");
+        let err = gate(
+            &caps,
+            &image_request(),
+            Provider::DeepSeek,
+            "deepseek-v4-pro",
+        )
+        .expect_err("image input must fail the Gate");
         match err {
             Error::Capability(e) => {
                 assert_eq!(e.model, "deepseek-v4-pro");
@@ -199,7 +215,9 @@ mod tests {
         .expect("deprecated id must warn, not refuse");
         assert_eq!(
             outcome.warnings,
-            vec![Warning::DeprecatedModel { model: "deepseek-v4-flash".into() }]
+            vec![Warning::DeprecatedModel {
+                model: "deepseek-v4-flash".into()
+            }]
         );
     }
 
@@ -218,8 +236,13 @@ mod tests {
             }
             ResolvedCapabilities::Unknown => panic!("override must produce Known"),
         }
-        gate(&caps, &image_request(), Provider::DeepSeek, "deepseek-v4-pro")
-            .expect("user override must relax the Gate");
+        gate(
+            &caps,
+            &image_request(),
+            Provider::DeepSeek,
+            "deepseek-v4-pro",
+        )
+        .expect("user override must relax the Gate");
     }
 
     #[test]
@@ -232,7 +255,9 @@ mod tests {
         let caps = ResolvedCapabilities::Known(over.apply_to(base));
         let mut request = text_request();
         request.options.response_schema = Some(serde_json::json!({"type": "object"}));
-        match gate(&caps, &request, Provider::Zhipu, "glm-5.3").expect_err("tightened override must refuse") {
+        match gate(&caps, &request, Provider::Zhipu, "glm-5.3")
+            .expect_err("tightened override must refuse")
+        {
             Error::Capability(e) => {
                 assert_eq!(e.model, "glm-5.3");
                 assert_eq!(e.missing, MissingCapability::StructuredOutput);
@@ -257,12 +282,16 @@ mod tests {
     #[test]
     fn unsupported_reasoning_effort_is_refused() {
         let caps = ResolvedCapabilities::Known(Capabilities {
-            reasoning: ReasoningMode::Effort { levels: BTreeSet::from(["low".into(), "high".into()]) },
+            reasoning: ReasoningMode::Effort {
+                levels: BTreeSet::from(["low".into(), "high".into()]),
+            },
             ..Capabilities::text_only(Source::Catalog)
         });
         let mut request = text_request();
         request.options.reasoning_effort = Some(crate::options::ReasoningEffort("max".into()));
-        match gate(&caps, &request, Provider::Moonshot, "kimi-k3").expect_err("unknown effort must refuse") {
+        match gate(&caps, &request, Provider::Moonshot, "kimi-k3")
+            .expect_err("unknown effort must refuse")
+        {
             Error::Capability(e) => {
                 assert_eq!(e.missing, MissingCapability::ReasoningEffort("max".into()));
             }
@@ -278,7 +307,9 @@ mod tests {
         });
         let mut request = text_request();
         request.options.max_tokens = Some(999_999);
-        match gate(&caps, &request, Provider::DeepSeek, "deepseek-v4-pro").expect_err("over-cap must refuse") {
+        match gate(&caps, &request, Provider::DeepSeek, "deepseek-v4-pro")
+            .expect_err("over-cap must refuse")
+        {
             Error::Config(e) => assert!(e.message.contains("8192")),
             other => panic!("expected Config error, got {other:?}"),
         }
@@ -287,8 +318,13 @@ mod tests {
     #[test]
     fn clean_text_request_produces_no_warnings() {
         let caps = ResolvedCapabilities::Known(Capabilities::text_only(Source::Catalog));
-        let outcome = gate(&caps, &text_request(), Provider::DeepSeek, "deepseek-v4-pro")
-            .expect("plain text chat must pass");
+        let outcome = gate(
+            &caps,
+            &text_request(),
+            Provider::DeepSeek,
+            "deepseek-v4-pro",
+        )
+        .expect("plain text chat must pass");
         assert!(outcome.warnings.is_empty());
     }
 }

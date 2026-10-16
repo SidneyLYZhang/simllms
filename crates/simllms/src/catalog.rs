@@ -1,6 +1,6 @@
 use crate::capabilities::{Capabilities, ResolvedCapabilities, Source};
+use crate::catalog_data;
 use crate::provider::Provider;
-use crate::{catalog_data};
 use std::collections::HashMap;
 
 /// The built-in table of Models and their Capabilities, generated from the
@@ -67,12 +67,18 @@ fn image_generation_overrides() -> Vec<(Provider, &'static str, Capabilities)> {
         (
             Provider::Zhipu,
             "cogview-4",
-            Capabilities { image_generation: true, ..Capabilities::text_only(Source::Catalog) },
+            Capabilities {
+                image_generation: true,
+                ..Capabilities::text_only(Source::Catalog)
+            },
         ),
         (
             Provider::DashScope,
             "wanx2.1-t2i-turbo",
-            Capabilities { image_generation: true, ..Capabilities::text_only(Source::Catalog) },
+            Capabilities {
+                image_generation: true,
+                ..Capabilities::text_only(Source::Catalog)
+            },
         ),
     ]
 }
@@ -105,7 +111,11 @@ mod tests {
     }
 
     fn text_request() -> ChatRequest {
-        ChatRequest { messages: vec![Message::text("hello")], options: Options::default(), stream: false }
+        ChatRequest {
+            messages: vec![Message::text("hello")],
+            options: Options::default(),
+            stream: false,
+        }
     }
 
     #[test]
@@ -125,8 +135,13 @@ mod tests {
     fn gate_refuses_images_for_text_only_models_on_real_entries() {
         let cat = builtin();
         let resolved = cat.resolve(Provider::DeepSeek, "deepseek-v4-pro");
-        let err = gate::gate(&resolved, &image_request(), Provider::DeepSeek, "deepseek-v4-pro")
-            .expect_err("deepseek-v4-pro is text-only");
+        let err = gate::gate(
+            &resolved,
+            &image_request(),
+            Provider::DeepSeek,
+            "deepseek-v4-pro",
+        )
+        .expect_err("deepseek-v4-pro is text-only");
         match err {
             Error::Capability(e) => assert_eq!(e.missing, MissingCapability::ImageInput),
             other => panic!("expected Capability error, got {other:?}"),
@@ -147,18 +162,36 @@ mod tests {
         let cat = builtin();
         // deepseek-v4-flash is marked deprecated in the snapshot.
         let resolved = cat.resolve(Provider::DeepSeek, "deepseek-v4-flash");
-        let outcome = gate::gate(&resolved, &text_request(), Provider::DeepSeek, "deepseek-v4-flash")
-            .expect("deprecated warns, never refuses");
-        assert_eq!(outcome.warnings, vec![Warning::DeprecatedModel { model: "deepseek-v4-flash".into() }]);
+        let outcome = gate::gate(
+            &resolved,
+            &text_request(),
+            Provider::DeepSeek,
+            "deepseek-v4-flash",
+        )
+        .expect("deprecated warns, never refuses");
+        assert_eq!(
+            outcome.warnings,
+            vec![Warning::DeprecatedModel {
+                model: "deepseek-v4-flash".into()
+            }]
+        );
     }
 
     #[test]
     fn unknown_ids_still_warn_and_pass() {
         let cat = builtin();
         let resolved = cat.resolve(Provider::OpenRouter, "some/new-model");
-        let outcome = gate::gate(&resolved, &image_request(), Provider::OpenRouter, "some/new-model")
-            .expect("catalog miss must warn-and-pass");
-        assert!(matches!(outcome.warnings.as_slice(), [Warning::UnknownModel { .. }]));
+        let outcome = gate::gate(
+            &resolved,
+            &image_request(),
+            Provider::OpenRouter,
+            "some/new-model",
+        )
+        .expect("catalog miss must warn-and-pass");
+        assert!(matches!(
+            outcome.warnings.as_slice(),
+            [Warning::UnknownModel { .. }]
+        ));
     }
 
     #[test]

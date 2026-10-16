@@ -29,7 +29,10 @@ pub struct ImageRequest {
 
 impl ImageRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
-        ImageRequest { prompt: prompt.into(), ..Default::default() }
+        ImageRequest {
+            prompt: prompt.into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -72,7 +75,10 @@ fn supports(provider: Provider, parameter: &str) -> bool {
     match provider {
         Provider::Zhipu => matches!(parameter, "prompt" | "size" | "seed"),
         Provider::DashScope => {
-            matches!(parameter, "prompt" | "negative_prompt" | "n" | "size" | "seed")
+            matches!(
+                parameter,
+                "prompt" | "negative_prompt" | "n" | "size" | "seed"
+            )
         }
         Provider::OpenRouter => matches!(parameter, "prompt" | "n" | "size"),
         _ => false,
@@ -166,14 +172,13 @@ pub fn translate(provider: Provider, model: &str, request: &ImageRequest) -> ser
 /// Normalizes a synchronous image response (Zhipu URL shape, OpenRouter
 /// base64 shape) into GeneratedImages.
 pub fn parse_sync(provider: Provider, body: &serde_json::Value) -> Result<ImageReply, Error> {
-    let items = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| Error::Api(crate::error::ApiError {
+    let items = body.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+        Error::Api(crate::error::ApiError {
             status: 200,
             provider_message: "image response has no `data` array".into(),
             raw_body: body.to_string(),
-        }))?;
+        })
+    })?;
 
     let mut images = Vec::new();
     for item in items {
@@ -182,28 +187,31 @@ pub fn parse_sync(provider: Provider, body: &serde_json::Value) -> Result<ImageR
         let image = match (b64, url) {
             (Some(b64), _) => GeneratedImage {
                 data: Some(
-                    base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        b64,
-                    )
-                    .map_err(|e| {
-                        Error::Api(crate::error::ApiError {
-                            status: 200,
-                            provider_message: format!("undecodable b64_json: {e}"),
-                            raw_body: body.to_string(),
-                        })
-                    })?,
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                        .map_err(|e| {
+                            Error::Api(crate::error::ApiError {
+                                status: 200,
+                                provider_message: format!("undecodable b64_json: {e}"),
+                                raw_body: body.to_string(),
+                            })
+                        })?,
                 ),
                 mime_type: match provider {
                     Provider::OpenRouter => Some("image/png".into()),
                     _ => None,
                 },
-                revised_prompt: item.get("revised_prompt").and_then(|r| r.as_str()).map(str::to_string),
+                revised_prompt: item
+                    .get("revised_prompt")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
                 ..Default::default()
             },
             (_, Some(url)) => GeneratedImage {
                 url: Some(url.to_string()),
-                revised_prompt: item.get("revised_prompt").and_then(|r| r.as_str()).map(str::to_string),
+                revised_prompt: item
+                    .get("revised_prompt")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
                 ..Default::default()
             },
             _ => {
@@ -230,8 +238,13 @@ mod tests {
     #[test]
     fn unsupported_provider_refuses_locally() {
         for provider in [Provider::DeepSeek, Provider::Moonshot, Provider::MiMo] {
-            let err = check(false, provider, "deepseek-v4-pro", &ImageRequest::new("a cat"))
-                .expect_err("must refuse locally");
+            let err = check(
+                false,
+                provider,
+                "deepseek-v4-pro",
+                &ImageRequest::new("a cat"),
+            )
+            .expect_err("must refuse locally");
             match err {
                 Error::Capability(e) => assert_eq!(e.missing, MissingCapability::ImageGeneration),
                 other => panic!("expected Capability, got {other:?}"),
@@ -241,7 +254,10 @@ mod tests {
 
     #[test]
     fn unsupported_parameter_names_parameter_and_model() {
-        let req = ImageRequest { negative_prompt: Some("rain".into()), ..ImageRequest::new("a cat") };
+        let req = ImageRequest {
+            negative_prompt: Some("rain".into()),
+            ..ImageRequest::new("a cat")
+        };
         let err = check(true, Provider::Zhipu, "cogview-4", &req).expect_err("must refuse");
         match err {
             Error::Config(e) => {
@@ -254,7 +270,10 @@ mod tests {
 
     #[test]
     fn supported_combinations_pass() {
-        let req = ImageRequest { size: Some("1024x1024".into()), ..ImageRequest::new("a cat") };
+        let req = ImageRequest {
+            size: Some("1024x1024".into()),
+            ..ImageRequest::new("a cat")
+        };
         assert!(check(true, Provider::Zhipu, "cogview-4", &req).is_ok());
         assert!(check(true, Provider::OpenRouter, "x/y", &req).is_ok());
     }
@@ -268,25 +287,43 @@ mod tests {
             ..ImageRequest::new("a cat")
         };
         let body = translate(Provider::DashScope, "wanx2.1-t2i-turbo", &req);
-        assert_eq!(body.pointer("/input/prompt"), Some(&serde_json::json!("a cat")));
-        assert_eq!(body.pointer("/input/negative_prompt"), Some(&serde_json::json!("blur")));
+        assert_eq!(
+            body.pointer("/input/prompt"),
+            Some(&serde_json::json!("a cat"))
+        );
+        assert_eq!(
+            body.pointer("/input/negative_prompt"),
+            Some(&serde_json::json!("blur"))
+        );
         assert_eq!(body.pointer("/parameters/n"), Some(&serde_json::json!(2)));
-        assert_eq!(body.pointer("/parameters/size"), Some(&serde_json::json!("1024x1024")));
+        assert_eq!(
+            body.pointer("/parameters/size"),
+            Some(&serde_json::json!("1024x1024"))
+        );
     }
 
     #[test]
     fn parses_url_and_base64_shapes_with_invariant() {
-        let zhipu = parse_sync(Provider::Zhipu, &serde_json::json!({
-            "data": [{ "url": "https://img.example/a.png" }]
-        }))
+        let zhipu = parse_sync(
+            Provider::Zhipu,
+            &serde_json::json!({
+                "data": [{ "url": "https://img.example/a.png" }]
+            }),
+        )
         .unwrap();
-        assert_eq!(zhipu.images[0].url.as_deref(), Some("https://img.example/a.png"));
+        assert_eq!(
+            zhipu.images[0].url.as_deref(),
+            Some("https://img.example/a.png")
+        );
         assert!(zhipu.images[0].data.is_none());
 
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG");
-        let or = parse_sync(Provider::OpenRouter, &serde_json::json!({
-            "data": [{ "b64_json": b64, "revised_prompt": "a big cat" }]
-        }))
+        let or = parse_sync(
+            Provider::OpenRouter,
+            &serde_json::json!({
+                "data": [{ "b64_json": b64, "revised_prompt": "a big cat" }]
+            }),
+        )
         .unwrap();
         assert_eq!(or.images[0].data.as_deref(), Some(&b"\x89PNG"[..]));
         assert!(or.images[0].url.is_none());

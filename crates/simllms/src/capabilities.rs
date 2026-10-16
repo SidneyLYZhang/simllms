@@ -130,7 +130,10 @@ mod tests {
     #[test]
     fn override_relaxes_image_input() {
         let base = Capabilities::text_only(Source::Catalog);
-        let over = CapabilityOverrides { image_input: Some(true), ..Default::default() };
+        let over = CapabilityOverrides {
+            image_input: Some(true),
+            ..Default::default()
+        };
         let caps = over.apply_to(base);
         assert_eq!(caps.source, Source::User);
         assert!(caps.accepts_image_input());
@@ -138,8 +141,14 @@ mod tests {
 
     #[test]
     fn override_tightens_structured_output() {
-        let base = Capabilities { structured_output: true, ..Capabilities::text_only(Source::Catalog) };
-        let over = CapabilityOverrides { structured_output: Some(false), ..Default::default() };
+        let base = Capabilities {
+            structured_output: true,
+            ..Capabilities::text_only(Source::Catalog)
+        };
+        let over = CapabilityOverrides {
+            structured_output: Some(false),
+            ..Default::default()
+        };
         let caps = over.apply_to(base);
         assert!(!caps.structured_output);
     }
@@ -147,7 +156,9 @@ mod tests {
     #[test]
     fn effort_membership() {
         let caps = Capabilities {
-            reasoning: ReasoningMode::Effort { levels: BTreeSet::from(["low".into(), "high".into()]) },
+            reasoning: ReasoningMode::Effort {
+                levels: BTreeSet::from(["low".into(), "high".into()]),
+            },
             ..Capabilities::text_only(Source::Catalog)
         };
         assert!(caps.supports_reasoning_effort("low"));

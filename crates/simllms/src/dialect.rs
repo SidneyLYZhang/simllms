@@ -1,8 +1,8 @@
+use crate::error::{ApiError, Error};
 use crate::message::{ContentBlock, Message};
 use crate::options::Options;
 use crate::provider::Provider;
 use crate::reply::Reply;
-use crate::error::{ApiError, Error};
 
 /// The v1 dialect is OpenAI-compatible: one JSON shape, translated from our
 /// domain types. Pure function — same inputs, same bytes, no I/O.
@@ -34,9 +34,21 @@ pub fn chat_body(
         ("max_tokens", options.max_tokens.map(|v| v.into())),
         ("stop", options.stop.clone().map(|v| v.into())),
         ("seed", options.seed.map(|v| v.into())),
-        ("presence_penalty", options.presence_penalty.map(|v| v.into())),
-        ("frequency_penalty", options.frequency_penalty.map(|v| v.into())),
-        ("reasoning_effort", options.reasoning_effort.as_ref().map(|e| e.0.clone().into())),
+        (
+            "presence_penalty",
+            options.presence_penalty.map(|v| v.into()),
+        ),
+        (
+            "frequency_penalty",
+            options.frequency_penalty.map(|v| v.into()),
+        ),
+        (
+            "reasoning_effort",
+            options
+                .reasoning_effort
+                .as_ref()
+                .map(|e| e.0.clone().into()),
+        ),
     ];
     for (key, value) in scalar {
         if let Some(v) = value {
@@ -47,9 +59,12 @@ pub fn chat_body(
         body.insert(
             "reasoning".into(),
             serde_json::Value::Object(
-                [("enabled".to_string(), serde_json::Value::Bool(options.reasoning_enabled.unwrap()))]
-                    .into_iter()
-                    .collect(),
+                [(
+                    "enabled".to_string(),
+                    serde_json::Value::Bool(options.reasoning_enabled.unwrap()),
+                )]
+                .into_iter()
+                .collect(),
             ),
         );
     }
@@ -114,11 +129,13 @@ pub fn parse_reply(body: &serde_json::Value) -> Result<Reply, Error> {
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Api(ApiError {
-            status: 200,
-            provider_message: "response is missing choices[0].message.content".into(),
-            raw_body: body.to_string(),
-        }))?
+        .ok_or_else(|| {
+            Error::Api(ApiError {
+                status: 200,
+                provider_message: "response is missing choices[0].message.content".into(),
+                raw_body: body.to_string(),
+            })
+        })?
         .to_string();
 
     let usage = body.get("usage").and_then(|u| {

@@ -26,9 +26,14 @@ async fn main() {
         .with_retry(RetryPolicy::disabled());
 
     let warns = client.warnings(&[Message::text("hello")], &Default::default());
-    println!("gate warnings: {warns:?} (gateway models are unknown to the Catalog — warn-and-pass)");
+    println!(
+        "gate warnings: {warns:?} (gateway models are unknown to the Catalog — warn-and-pass)"
+    );
 
-    let reply = client.chat(vec![Message::text("hello")]).await.expect("gateway chat failed");
+    let reply = client
+        .chat(vec![Message::text("hello")])
+        .await
+        .expect("gateway chat failed");
     mock.assert();
     println!("{}", reply.content);
     println!("[usage] {:?}", reply.usage);
