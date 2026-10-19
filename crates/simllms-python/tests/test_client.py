@@ -23,9 +23,13 @@ import pytest
 import simllms
 from simllms import (
     APIError,
+    AsyncClient,
+    Auth,
     CapabilityError,
     Client,
     ConfigError,
+    DashScopeRegion,
+    RetryPolicy,
     SimLLMError,
     TransportError,
 )
@@ -56,6 +60,9 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         behavior = self.server.behavior  # type: ignore[attr-defined]
         behavior["request_log"].append(self._read_json())
+        behavior["headers_log"].append(
+            {k.lower(): v for k, v in self.headers.items()}
+        )
         self._route(behavior)
 
     def do_GET(self) -> None:
@@ -90,10 +97,12 @@ class MockHandler(BaseHTTPRequestHandler):
 class MockGateway:
     def __init__(self) -> None:
         self.request_log: list[Any] = []
+        self.headers_log: list[dict[str, str]] = []
         self.routes: dict[str, dict[str, Any]] = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
         self.server.behavior = {  # type: ignore[attr-defined]
             "request_log": self.request_log,
+            "headers_log": self.headers_log,
             "routes": self.routes,
         }
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -585,3 +594,284 @@ def test_logging_under_fixed_logger_name(
     assert any("client created" in r.getMessage() for r in simllms_records)
     assert any("chat" in r.getMessage() for r in simllms_records)
     assert all("sk-test" not in r.getMessage() for r in simllms_records)
+
+
+# --- Configuration parity (spec #23 / ticket #24) ---------------------------
+# The mock sees headers but never the host a region would pick: an explicit
+# base_url wins over a region, so every test here stays on the mock gateway.
+
+
+def test_default_auth_is_bearer_on_the_wire(gateway: MockGateway) -> None:
+    client = make_client(gateway)
+    client.chat(["hi"])
+
+    headers = gateway.headers_log[-1]
+    assert headers["authorization"] == "Bearer sk-test"
+
+
+def test_auth_header_shape_reaches_the_wire(gateway: MockGateway) -> None:
+    client = make_client(gateway, auth=Auth.header("x-api-key", "sk-x"))
+    client.chat(["hi"])
+
+    headers = gateway.headers_log[-1]
+    assert headers["x-api-key"] == "sk-x"
+    assert "authorization" not in headers
+
+
+def test_auth_bearer_is_explicitly_selectable(gateway: MockGateway) -> None:
+    client = make_client(gateway, auth=Auth.bearer())
+    client.chat(["hi"])
+
+    assert gateway.headers_log[-1]["authorization"] == "Bearer sk-test"
+
+
+def test_default_headers_ride_on_the_request(gateway: MockGateway) -> None:
+    client = make_client(gateway, default_headers={"X-Tenant": "acme"})
+    client.chat(["hi"])
+
+    assert gateway.headers_log[-1]["x-tenant"] == "acme"
+
+
+def test_explicit_base_url_wins_over_the_region_host(gateway: MockGateway) -> None:
+    client = Client(
+        "dashscope",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url,
+        dashscope_region=DashScopeRegion.singapore(),
+    )
+    reply = client.chat(["hi"])
+
+    assert reply.content == "hello from the mock"
+
+
+def test_explicit_base_url_wins_over_zhipu_international(
+    gateway: MockGateway,
+) -> None:
+    client = Client(
+        "zhipu",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url,
+        zhipu_international=True,
+    )
+    reply = client.chat(["hi"])
+
+    assert reply.content == "hello from the mock"
+
+
+def test_region_auth_retry_and_header_kwargs_translate_to_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCore:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(simllms._core, "Client", FakeCore)
+    simllms.Client(
+        "dashscope",
+        "test-model",
+        api_key="sk-test",
+        auth=Auth.header("x-api-key", "sk-x"),
+        dashscope_region=DashScopeRegion.workspace("llm-x", "cn-beijing"),
+        retry=RetryPolicy(max_attempts=5),
+        stream_timeouts=(1.0, 2.0),
+        default_headers={"X-Tenant": "acme"},
+    )
+
+    assert captured["auth"] == ("header", "x-api-key", "sk-x")
+    assert captured["dashscope_region"] == ("workspace", "llm-x", "cn-beijing")
+    assert captured["retry"] == (True, 5)
+    assert captured["stream_timeouts"] == (1.0, 2.0)
+    assert captured["default_headers"] == {"X-Tenant": "acme"}
+    assert captured["zhipu_international"] is False
+
+
+def test_bearer_and_region_factories_translate_to_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCore:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(simllms._core, "Client", FakeCore)
+    simllms.Client(
+        "dashscope",
+        "test-model",
+        api_key="sk-test",
+        auth=Auth.bearer(),
+        dashscope_region=DashScopeRegion.cn(),
+    )
+
+    assert captured["auth"] == ("bearer",)
+    assert captured["dashscope_region"] == "cn"
+
+
+def test_retry_policy_retries_then_succeeds(gateway: MockGateway) -> None:
+    state = {"count": 0}
+
+    def flaky(handler: MockHandler) -> None:
+        state["count"] += 1
+        if state["count"] <= 2:
+            handler._respond(500, {"error": {"message": "upstream hiccup"}})
+        else:
+            handler._respond(200, SUCCESS_BODY)
+
+    gateway.route("/v1/flaky", flaky)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/flaky",
+        retry=RetryPolicy(max_attempts=3),
+    )
+
+    reply = client.chat(["hi"])
+
+    assert reply.content == "hello from the mock"
+    assert len(gateway.request_log) == 3
+
+
+def test_retry_disabled_fails_on_the_first_attempt(gateway: MockGateway) -> None:
+    def broken(handler: MockHandler) -> None:
+        handler._respond(500, {"error": {"message": "upstream hiccup"}})
+
+    gateway.route("/v1/broken", broken)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/broken",
+        retry=RetryPolicy.disabled(),
+    )
+
+    with pytest.raises(APIError) as excinfo:
+        client.chat(["hi"])
+
+    assert excinfo.value.status == 500
+    assert len(gateway.request_log) == 1
+
+
+def _sse_handler(handler: MockHandler) -> None:
+    payload = SSE_BODY.encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+
+def test_stream_first_token_timeout_surfaces_transport_error(
+    gateway: MockGateway,
+) -> None:
+    def sse_asleep(handler: MockHandler) -> None:
+        # The head arrives at once; the body stalls past the first-token
+        # timeout — the same shape the Rust core's own timeout test uses.
+        payload = SSE_BODY.encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        time.sleep(1.0)
+        handler.wfile.write(payload)
+
+    gateway.route("/v1/asleep", sse_asleep)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/asleep",
+        stream_timeouts=(0.2, 1.0),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(TransportError):
+        list(client.chat_stream(["hi"]))
+    assert time.monotonic() - started < 5.0, "the first-token timeout did not fire"
+
+
+def test_stream_timeouts_leave_a_healthy_stream_alone(gateway: MockGateway) -> None:
+    gateway.route("/v1/stream", _sse_handler)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/stream",
+        stream_timeouts=(5.0, 5.0),
+    )
+
+    chunks = list(client.chat_stream(["hi"]))
+
+    assert [c.text for c in chunks if c.text is not None] == ["Hel", "lo"]
+
+
+def test_warnings_reports_an_unknown_model() -> None:
+    # No gateway: warnings() must answer from the catalog alone.
+    client = Client("deepseek", "totally-unknown-model", api_key="sk-test")
+
+    warnings = client.warnings(["hi"])
+
+    assert len(warnings) == 1
+    assert warnings[0].kind == "unknown_model"
+    assert warnings[0].provider == "deepseek"
+    assert warnings[0].model == "totally-unknown-model"
+
+
+def test_warnings_reports_a_deprecated_model() -> None:
+    client = Client("deepseek", "deepseek-v4-flash", api_key="sk-test")
+
+    warnings = client.warnings(["hi"])
+
+    assert len(warnings) == 1
+    assert warnings[0].kind == "deprecated_model"
+    assert warnings[0].model == "deepseek-v4-flash"
+    assert warnings[0].provider is None
+
+
+def test_warnings_stay_empty_for_a_known_model() -> None:
+    client = Client("deepseek", "deepseek-v4-pro", api_key="sk-test")
+
+    assert client.warnings(["hi"]) == []
+
+
+def test_refresh_models_returns_the_mock_listing(gateway: MockGateway) -> None:
+    def listing(handler: MockHandler) -> None:
+        handler._respond(200, {"data": [{"id": "mock-b"}, {"id": "mock-a"}]})
+
+    gateway.route("/v1/models", listing)
+    client = make_client(gateway)
+
+    assert set(client.refresh_models()) == {"mock-a", "mock-b"}
+
+
+def test_refresh_models_refuses_a_provider_without_a_listing(
+    gateway: MockGateway,
+) -> None:
+    client = Client(
+        "zhipu", "test-model", api_key="sk-test", base_url=gateway.base_url
+    )
+
+    with pytest.raises(ConfigError):
+        client.refresh_models()
+
+
+def test_async_refresh_models_returns_the_listing(gateway: MockGateway) -> None:
+    def listing(handler: MockHandler) -> None:
+        handler._respond(200, {"data": [{"id": "mock-b"}, {"id": "mock-a"}]})
+
+    gateway.route("/v1/models", listing)
+    client = AsyncClient(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url,
+    )
+
+    async def main() -> list[str]:
+        return await client.refresh_models()
+
+    assert set(asyncio.run(main())) == {"mock-a", "mock-b"}

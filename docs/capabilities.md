@@ -38,9 +38,14 @@ client.warnings(&messages, &options);   // 预览警告，不发请求
 client.refresh_models().await?;         // 一次显式调用后，未知 → Known（Source::Provider）
 ```
 
-这两个入口本版只在 Rust 侧可用：Python 里未知模型同样是 warn-and-pass、请求
-照发，只是暂时读不到那条结构化警告。清单见
-[快速开始](getting-started.md)的 Rust-only 一节。
+```python
+client.warnings(messages, options)   # 预览警告，不发请求
+client.refresh_models()              # 一次显式调用后，未知 → Known（Source::Provider）
+```
+
+两侧入口一致；`refresh_models()` 只在 DeepSeek、Moonshot、DashScope、
+OpenRouter 可用——其余提供商没有机器可读的模型列表，会得到 ConfigError，
+目录保持权威。
 
 ## 覆盖示例
 

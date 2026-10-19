@@ -1,8 +1,12 @@
 """Type hints for `simllms._core` (the pyo3 extension module).
 
-The stub mirrors the Rust surface: Client kwargs, Reply/Chunk/GeneratedImage
-attributes, and the exception attributes map_error attaches (model/missing/
-suggestions on CapabilityError; status/provider_message/raw_body on APIError).
+The stub mirrors the Rust surface: Client kwargs, Reply/Chunk/GeneratedImage/
+Warning attributes, and the exception attributes map_error attaches (model/
+missing/suggestions on CapabilityError; status/provider_message/raw_body on
+APIError). The primitive shapes of `auth`, `dashscope_region` and `retry`
+are what the pure-Python layer sends after decomposing its dataclasses:
+`("bearer",)` or a `("header", name, value)` triple; `"cn"`, `"singapore"`
+or a `("workspace", id, region)` triple; an `(enabled, max_attempts)` pair.
 """
 
 from typing import Any, Iterator, Sequence
@@ -55,6 +59,12 @@ class GeneratedImage:
     revised_prompt: str | None
 
 
+class Warning:
+    kind: str
+    provider: str | None
+    model: str
+
+
 class ChatStream(Iterator[Chunk]):
     def __iter__(self) -> ChatStream: ...
     def __next__(self) -> Chunk: ...
@@ -71,6 +81,12 @@ class Client:
         options: dict[str, Any] | None = None,
         capability_overrides: dict[str, Any] | None = None,
         timeout: float | None = None,
+        auth: tuple[str, ...] | None = None,
+        dashscope_region: str | tuple[str, str, str] | None = None,
+        zhipu_international: bool = False,
+        default_headers: dict[str, str] | None = None,
+        retry: tuple[bool, int] | None = None,
+        stream_timeouts: tuple[float, float] | None = None,
     ) -> None: ...
 
     def chat(
@@ -105,3 +121,11 @@ class Client:
         messages: Sequence[Any],
         options: dict[str, Any] | None = None,
     ) -> str: ...
+
+    def warnings(
+        self,
+        messages: Sequence[Any],
+        options: dict[str, Any] | None = None,
+    ) -> list[Warning]: ...
+
+    def refresh_models(self) -> list[str]: ...

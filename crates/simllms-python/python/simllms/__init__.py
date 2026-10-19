@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterator, Sequence
-from typing import Any
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from simllms import _core
 from simllms._core import (
@@ -25,20 +26,25 @@ from simllms._core import (
     Reply,
     SimLLMError,
     TransportError,
+    Warning,
 )
 
 __all__ = [
     "APIError",
     "AsyncClient",
+    "Auth",
     "CapabilityError",
     "Chunk",
     "Client",
     "ConfigError",
+    "DashScopeRegion",
     "GeneratedImage",
     "LOGGER_NAME",
     "Reply",
+    "RetryPolicy",
     "SimLLMError",
     "TransportError",
+    "Warning",
     "__version__",
 ]
 
@@ -61,6 +67,71 @@ response_schema. Provider-specific extras go under `extra`."""
 _DONE = object()
 
 
+@dataclass(frozen=True)
+class Auth:
+    """The credential's header shape.
+
+    :meth:`Auth.bearer` (what ``auth=None`` gives you, except on MiMo) sends
+    ``Authorization: Bearer <key>``; :meth:`Auth.header` sends the key in a
+    named header — for gateways that want ``api-key:`` or ``x-api-key:``.
+    """
+
+    header_name: str | None = None
+    header_value: str | None = None
+
+    @staticmethod
+    def bearer() -> Auth:
+        return Auth()
+
+    @staticmethod
+    def header(name: str, value: str) -> Auth:
+        if not name:
+            raise ValueError("`Auth.header` needs a header name")
+        return Auth(name, value)
+
+
+@dataclass(frozen=True)
+class DashScopeRegion:
+    """DashScope's host selection.
+
+    :meth:`DashScopeRegion.cn` is the shared Beijing host (the default),
+    :meth:`DashScopeRegion.singapore` the shared international one, and
+    :meth:`DashScopeRegion.workspace` a dedicated workspace endpoint. An
+    explicit ``base_url`` outranks any region.
+    """
+
+    kind: Literal["cn", "singapore", "workspace"]
+    id: str | None = None
+    region: str | None = None
+
+    @staticmethod
+    def cn() -> DashScopeRegion:
+        return DashScopeRegion("cn")
+
+    @staticmethod
+    def singapore() -> DashScopeRegion:
+        return DashScopeRegion("singapore")
+
+    @staticmethod
+    def workspace(id: str, region: str) -> DashScopeRegion:
+        return DashScopeRegion("workspace", id=id, region=region)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Attempt-count policy for chat and streaming calls.
+
+    ``max_attempts`` counts total sends, not retries; the default is 3.
+    :meth:`RetryPolicy.disabled` turns retrying off.
+    """
+
+    max_attempts: int = 3
+
+    @staticmethod
+    def disabled() -> RetryPolicy:
+        return RetryPolicy(max_attempts=1)
+
+
 class Client:
     """Annotated surface over the Rust core.
 
@@ -78,7 +149,34 @@ class Client:
         options: OptionsLike | None = None,
         capability_overrides: dict[str, Any] | None = None,
         timeout: float | None = None,
+        auth: Auth | None = None,
+        dashscope_region: DashScopeRegion | None = None,
+        zhipu_international: bool = False,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        stream_timeouts: tuple[float, float] | None = None,
     ) -> None:
+        auth_kwarg: tuple[str, ...] | None
+        if auth is None:
+            auth_kwarg = None
+        elif auth.header_name is None:
+            auth_kwarg = ("bearer",)
+        else:
+            auth_kwarg = ("header", auth.header_name, auth.header_value or "")
+        region_kwarg: str | tuple[str, str, str] | None
+        if dashscope_region is None:
+            region_kwarg = None
+        elif dashscope_region.kind == "workspace":
+            region_kwarg = (
+                "workspace",
+                dashscope_region.id or "",
+                dashscope_region.region or "",
+            )
+        else:
+            region_kwarg = dashscope_region.kind
+        retry_kwarg = (
+            (retry.max_attempts > 1, retry.max_attempts) if retry else None
+        )
         self._core = _core.Client(
             provider,
             model,
@@ -87,6 +185,12 @@ class Client:
             options=options,
             capability_overrides=capability_overrides,
             timeout=timeout,
+            auth=auth_kwarg,
+            dashscope_region=region_kwarg,
+            zhipu_international=zhipu_international,
+            default_headers=dict(default_headers) if default_headers else None,
+            retry=retry_kwarg,
+            stream_timeouts=stream_timeouts,
         )
         logger.debug("client created: %s/%s", provider, model)
 
@@ -124,6 +228,24 @@ class Client:
         """The exact request this client would send — credential-free."""
         return self._core.debug_request(messages, options)
 
+    def warnings(
+        self,
+        messages: Sequence[MessageLike],
+        options: OptionsLike | None = None,
+    ) -> list[Warning]:
+        """The Gate's structured warnings for this request, answered from the
+        catalog alone: an unknown Model Id (:data:`Warning.kind` is
+        ``"unknown_model"``) and a deprecated one (``"deprecated_model"``)
+        pass through at call time — this makes them visible before you pay.
+        """
+        return self._core.warnings(messages, options)
+
+    def refresh_models(self) -> list[str]:
+        """Consult the provider's own model listing (blocking). Only
+        DeepSeek, Moonshot, DashScope and OpenRouter publish one; other
+        providers raise ConfigError, and the catalog stays authoritative."""
+        return self._core.refresh_models()
+
 
 class AsyncClient:
     """Async wrapper over :class:`Client`.
@@ -160,3 +282,6 @@ class AsyncClient:
 
     async def generate_image(self, prompt: str, **kwargs: Any) -> list[GeneratedImage]:
         return await asyncio.to_thread(self._sync.generate_image, prompt, **kwargs)
+
+    async def refresh_models(self) -> list[str]:
+        return await asyncio.to_thread(self._sync.refresh_models)

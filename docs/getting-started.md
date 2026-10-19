@@ -20,24 +20,15 @@ pip install simllms
 
 两者是同一套领域模型的两张皮：请求形状、响应形状、错误分层完全一致。
 
-### Python 暂未绑定的客户端入口 / Rust-only for now
+### 客户端入口 / Client entry points
 
-本版的 Python 客户端能对话、能流式、能结构化输出、能生图，也能声明能力覆盖；
-下面这些入口只在 Rust 侧可用，Python 绑定会在后续 minor 版本补齐（追踪于 issue #22）：
+两个语言的客户端入口一致：Rust builder 上的每个入口，Python 侧都有对应的
+构造参数或方法——鉴权头形状、DashScope 区域与 Workspace、智谱国际站端点、
+固定请求头、重试策略、流式首 token 与空闲超时、`refresh_models`、`warnings`。
+此前维护的"Rust-only 清单"已随 Python 绑定补齐而清空（原追踪于 issue #22）。
 
 <!-- rust-only-begin -->
-- `with_auth` — 非 Bearer 的鉴权头形状，例如自定义网关要求 api-key: 或 x-api-key:
-- `with_default_header` — 给每个请求附加固定请求头
-- `with_dashscope_region` — 通义千问（DashScope）的区域与 Workspace 选择
-- `with_zhipu_international` — 智谱国际站端点
-- `with_retry` — 重试策略：关闭重试，或改次数与退避
-- `with_stream_timeouts` — 流式的首 token 与空闲超时，分别设置
-- `refresh_models` — 从提供商自己的模型列表刷新能力，不等发版
-- `warnings` — 未知 Model Id 时那条结构化警告（ADR-0005）的读取入口
 <!-- rust-only-end -->
-
-需要这些入口又只能用 Python 时，把该项当成选型约束，不要靠改 base_url 变通——
-base_url 只覆盖端点，不覆盖鉴权头形状与超时档位。
 
 ## 第一次调用 / First call
 

@@ -16,7 +16,10 @@ use simllms::capabilities::CapabilityOverrides;
 use simllms::error::{Error, MissingCapability};
 use simllms::message::{ContentBlock, ImageSource, Message, Role};
 use simllms::options::Options;
-use simllms::provider::Provider;
+use simllms::provider::{
+    DASHSCOPE_AP_NORTHEAST_1, DASHSCOPE_AP_SOUTHEAST_1, DASHSCOPE_CN_BEIJING,
+    DASHSCOPE_CN_HONGKONG, DASHSCOPE_EU_CENTRAL_1, DASHSCOPE_US_EAST_1, DashScopeRegion, Provider,
+};
 use simllms::reply::Reply;
 
 create_exception!(
@@ -75,6 +78,75 @@ fn parse_provider(name: &str) -> PyResult<Provider> {
             "unknown provider `{other}`; expected deepseek, moonshot, dashscope, zhipu, mimo, openrouter, or custom"
         ))),
     }
+}
+
+/// `("bearer",)` or a `(name, value)` pair, as the pure-Python layer sends
+/// it. `None` keeps the provider default (Bearer, except MiMo's `api-key:`).
+fn apply_auth(client: simllms::Client, auth: &Bound<'_, PyAny>) -> PyResult<simllms::Client> {
+    if let Ok((kind, name, value)) = auth.extract::<(String, String, String)>() {
+        if kind == "header" {
+            return Ok(client.with_auth(simllms::Auth::Header { name, value }));
+        }
+        return Err(PyTypeError::new_err(format!(
+            "unknown auth shape `{kind}`; expected `(\"bearer\",)` or a `(\"header\", name, value)` triple"
+        )));
+    }
+    if let Ok((kind,)) = auth.extract::<(String,)>() {
+        if kind == "bearer" {
+            return Ok(client.with_auth(simllms::Auth::Bearer));
+        }
+        return Err(PyTypeError::new_err(format!(
+            "unknown auth shape `{kind}`; expected `(\"bearer\",)` or a `(header, name, value)` triple"
+        )));
+    }
+    Err(PyTypeError::new_err(
+        "auth must be `(\"bearer\",)` or a `(header, name, value)` triple",
+    ))
+}
+
+/// `"cn"`, `"singapore"`, or a `("workspace", id, region)` triple. The region
+/// must be one DashScope documents for workspaces — anything else is a typo,
+/// and a typo here points real traffic at a host that does not exist.
+fn apply_dashscope_region(
+    client: simllms::Client,
+    region: &Bound<'_, PyAny>,
+) -> PyResult<simllms::Client> {
+    if let Ok(kind) = region.extract::<String>() {
+        let region = match kind.as_str() {
+            "cn" => DashScopeRegion::Cn,
+            "singapore" => DashScopeRegion::Singapore,
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unknown DashScope region `{other}`; expected \"cn\", \"singapore\", or a (\"workspace\", id, region) triple"
+                )));
+            }
+        };
+        return Ok(client.with_dashscope_region(region));
+    }
+    if let Ok((kind, id, workspace_region)) = region.extract::<(String, String, String)>() {
+        if kind != "workspace" {
+            return Err(PyTypeError::new_err(format!(
+                "unknown DashScope region shape `{kind}`; expected \"cn\", \"singapore\", or a (\"workspace\", id, region) triple"
+            )));
+        }
+        let known = match workspace_region.as_str() {
+            DASHSCOPE_CN_BEIJING => DASHSCOPE_CN_BEIJING,
+            DASHSCOPE_AP_SOUTHEAST_1 => DASHSCOPE_AP_SOUTHEAST_1,
+            DASHSCOPE_CN_HONGKONG => DASHSCOPE_CN_HONGKONG,
+            DASHSCOPE_EU_CENTRAL_1 => DASHSCOPE_EU_CENTRAL_1,
+            DASHSCOPE_AP_NORTHEAST_1 => DASHSCOPE_AP_NORTHEAST_1,
+            DASHSCOPE_US_EAST_1 => DASHSCOPE_US_EAST_1,
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unknown DashScope workspace region `{other}`; expected cn-beijing, ap-southeast-1, cn-hongkong, eu-central-1, ap-northeast-1, or us-east-1"
+                )));
+            }
+        };
+        return Ok(client.with_dashscope_region(DashScopeRegion::Workspace { id, region: known }));
+    }
+    Err(PyTypeError::new_err(
+        "dashscope_region must be \"cn\", \"singapore\", or a (\"workspace\", id, region) triple",
+    ))
 }
 
 fn map_error(err: Error) -> PyErr {
@@ -173,7 +245,7 @@ fn parse_options(dict: &Bound<'_, PyDict>) -> PyResult<Options> {
             other => {
                 return Err(PyTypeError::new_err(format!(
                     "unknown option `{other}`; provider-specific extras go under `extra`"
-                )))
+                )));
             }
         }
     }
@@ -216,7 +288,7 @@ fn parse_overrides(dict: &Bound<'_, PyDict>) -> PyResult<CapabilityOverrides> {
             other => {
                 return Err(PyTypeError::new_err(format!(
                     "unknown capability override `{other}`"
-                )))
+                )));
             }
         }
     }
@@ -266,7 +338,9 @@ fn parse_block(dict: &Bound<'_, PyDict>) -> PyResult<ContentBlock> {
             use base64::Engine as _;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
-                .map_err(|e| PyTypeError::new_err(format!("image_base64 `data` is not valid base64: {e}")))?;
+                .map_err(|e| {
+                    PyTypeError::new_err(format!("image_base64 `data` is not valid base64: {e}"))
+                })?;
             Ok(ContentBlock::Image(ImageSource::Base64 {
                 data: bytes,
                 mime_type,
@@ -299,7 +373,15 @@ fn parse_messages(list: &Bound<'_, PyList>) -> PyResult<Vec<Message>> {
         let content = if let Ok(text) = content_value.extract::<String>() {
             vec![ContentBlock::Text(text)]
         } else if let Ok(blocks) = content_value.cast::<PyList>() {
-            blocks.iter().map(|b| parse_block(b.cast::<PyDict>().map_err(|_| PyTypeError::new_err("content blocks must be dicts"))?)).collect::<PyResult<Vec<_>>>()?
+            blocks
+                .iter()
+                .map(|b| {
+                    parse_block(
+                        b.cast::<PyDict>()
+                            .map_err(|_| PyTypeError::new_err("content blocks must be dicts"))?,
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?
         } else {
             return Err(PyTypeError::new_err(
                 "message `content` must be a str or a list of blocks",
@@ -342,6 +424,43 @@ impl From<Reply> for PyReply {
             prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
             completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
             total_tokens: usage.and_then(|u| u.total_tokens),
+        }
+    }
+}
+
+/// One Gate warning: an unknown Model Id passes through (ADR-0005) and a
+/// deprecated one is still served, and `warnings()` makes both visible
+/// before a call is paid for. `kind` is `"unknown_model"` or
+/// `"deprecated_model"`; `provider` is set only for the unknown kind.
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Eq)]
+struct PyWarning {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    provider: Option<String>,
+    #[pyo3(get)]
+    model: String,
+}
+
+impl From<simllms::Warning> for PyWarning {
+    fn from(warning: simllms::Warning) -> Self {
+        match warning {
+            simllms::Warning::UnknownModel { provider, model } => PyWarning {
+                kind: "unknown_model".into(),
+                provider: Some(provider),
+                model,
+            },
+            simllms::Warning::DeprecatedModel { model } => PyWarning {
+                kind: "deprecated_model".into(),
+                provider: None,
+                model,
+            },
+            // `Warning` is `#[non_exhaustive]`, so the compiler cannot make a
+            // future variant a compile error here. A warning that reaches
+            // Python unmapped would silently lie about its kind — crash in
+            // development instead.
+            _ => unreachable!("a new `simllms::Warning` variant must be mapped here"),
         }
     }
 }
@@ -446,7 +565,8 @@ impl From<simllms::image::GeneratedImage> for PyGeneratedImage {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (provider, model, api_key=None, *, base_url=None, options=None, capability_overrides=None, timeout=None))]
+    #[pyo3(signature = (provider, model, api_key=None, *, base_url=None, options=None, capability_overrides=None, timeout=None, auth=None, dashscope_region=None, zhipu_international=false, default_headers=None, retry=None, stream_timeouts=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         provider: &str,
         model: &str,
@@ -455,31 +575,74 @@ impl Client {
         options: Option<&Bound<'_, PyDict>>,
         capability_overrides: Option<&Bound<'_, PyDict>>,
         timeout: Option<f64>,
+        auth: Option<&Bound<'_, PyAny>>,
+        dashscope_region: Option<&Bound<'_, PyAny>>,
+        zhipu_international: bool,
+        default_headers: Option<&Bound<'_, PyDict>>,
+        retry: Option<(bool, u32)>,
+        stream_timeouts: Option<(f64, f64)>,
     ) -> PyResult<Self> {
         let provider = parse_provider(provider)?;
         let mut client = match api_key {
             Some(key) => simllms::Client::new(provider, model, key),
             None => simllms::Client::from_env(provider, model).map_err(map_error)?,
         };
-        if let Some(url) = base_url {
-            client = client.with_base_url(url);
-        }
         if let Some(dict) = options {
             client = client.with_options(parse_options(dict)?);
         }
         if let Some(dict) = capability_overrides {
             client = client.with_capability_overrides(parse_overrides(dict)?);
         }
+        if let Some(auth) = auth {
+            client = apply_auth(client, auth)?;
+        }
+        if let Some(region) = dashscope_region {
+            client = apply_dashscope_region(client, region)?;
+        }
+        if zhipu_international {
+            client = client.with_zhipu_international();
+        }
+        if let Some(headers) = default_headers {
+            for (name, value) in headers.iter() {
+                client = client
+                    .with_default_header(name.extract::<String>()?, value.extract::<String>()?);
+            }
+        }
+        if let Some((enabled, max_attempts)) = retry {
+            client = client.with_retry(simllms::RetryPolicy {
+                enabled,
+                max_attempts,
+            });
+        }
+        if let Some((first_token, idle)) = stream_timeouts {
+            client = client.with_stream_timeouts(
+                Duration::from_secs_f64(first_token),
+                Duration::from_secs_f64(idle),
+            );
+        }
         if let Some(seconds) = timeout {
             client = client.with_timeout(Duration::from_secs_f64(seconds));
         }
-        Ok(Client { inner: Arc::new(client) })
+        // Applied last on purpose: an explicit base_url outranks the host a
+        // region or the international endpoint would pick, which is also the
+        // escape hatch that keeps the binding tests on the mock gateway.
+        if let Some(url) = base_url {
+            client = client.with_base_url(url);
+        }
+        Ok(Client {
+            inner: Arc::new(client),
+        })
     }
 
     /// Chat once. `messages` is a list of str (treated as user messages) or
     /// dicts `{"role": ..., "content": ...}`. Returns a Reply.
     #[pyo3(signature = (messages, options=None))]
-    fn chat(&self, py: Python<'_>, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<PyReply> {
+    fn chat(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyList>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyReply> {
         let messages = parse_messages(messages)?;
         let options = match options {
             Some(dict) => parse_options(dict)?,
@@ -498,7 +661,12 @@ impl Client {
     /// calling thread on one SSE event (the async path lives in the pure-
     /// Python layer, which parks each step on a worker thread).
     #[pyo3(signature = (messages, options=None))]
-    fn chat_stream(&self, py: Python<'_>, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<PyChatStream> {
+    fn chat_stream(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyList>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyChatStream> {
         let messages = parse_messages(messages)?;
         let options = match options {
             Some(dict) => parse_options(dict)?,
@@ -507,8 +675,7 @@ impl Client {
         let inner = self.inner.clone();
         let stream = py
             .detach(move || {
-                runtime()
-                    .block_on(async move { inner.chat_stream_with(messages, options).await })
+                runtime().block_on(async move { inner.chat_stream_with(messages, options).await })
             })
             .map_err(map_error)?;
         Ok(PyChatStream {
@@ -555,20 +722,62 @@ impl Client {
         py.detach(move || {
             runtime()
                 .block_on(async move { inner.generate_image_with(request, knobs).await })
-                .map(|reply| reply.images.into_iter().map(PyGeneratedImage::from).collect())
+                .map(|reply| {
+                    reply
+                        .images
+                        .into_iter()
+                        .map(PyGeneratedImage::from)
+                        .collect()
+                })
                 .map_err(map_error)
         })
     }
 
     /// The exact request this client would send, credential-free.
     #[pyo3(signature = (messages, options=None))]
-    fn debug_request(&self, messages: &Bound<'_, PyList>, options: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
+    fn debug_request(
+        &self,
+        messages: &Bound<'_, PyList>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
         let messages = parse_messages(messages)?;
         let options = match options {
             Some(dict) => parse_options(dict)?,
             None => Options::default(),
         };
         Ok(self.inner.debug_request(&messages, &options))
+    }
+
+    /// The Gate's structured warnings for this request, answered from the
+    /// catalog alone — no network call, no refusal.
+    #[pyo3(signature = (messages, options=None))]
+    fn warnings(
+        &self,
+        messages: &Bound<'_, PyList>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyWarning>> {
+        let messages = parse_messages(messages)?;
+        let options = match options {
+            Some(dict) => parse_options(dict)?,
+            None => Options::default(),
+        };
+        Ok(self
+            .inner
+            .warnings(&messages, &options)
+            .into_iter()
+            .map(PyWarning::from)
+            .collect())
+    }
+
+    /// Consult the provider's own model listing. One blocking call, no retry;
+    /// providers without a machine-readable listing raise ConfigError.
+    fn refresh_models(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            runtime()
+                .block_on(async move { inner.refresh_models().await })
+                .map_err(map_error)
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -589,5 +798,6 @@ fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Chunk", m.py().get_type::<PyChunk>())?;
     m.add_class::<PyChatStream>()?;
     m.add("GeneratedImage", m.py().get_type::<PyGeneratedImage>())?;
+    m.add("Warning", m.py().get_type::<PyWarning>())?;
     Ok(())
 }

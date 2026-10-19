@@ -9,6 +9,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The eight configuration and introspection entry points that were Rust-only
+  are now bound in Python too.** The constructor takes `auth` (`Auth.bearer()` /
+  `Auth.header(name, value)`), `dashscope_region`
+  (`DashScopeRegion.cn()` / `.singapore()` / `.workspace(id, region)`),
+  `zhipu_international`, `default_headers`, `retry` (`RetryPolicy`), and
+  `stream_timeouts`; and `Client.warnings()` / `Client.refresh_models()` (sync
+  and async) join the surface. `Warning` is exported as a typed object with a
+  `kind` of `unknown_model` or `deprecated_model` instead of a bare string, so
+  the Gate's advisory answers are inspectable on the Python side.
 - **Both packages now describe themselves truthfully on their registry.**
   `crates/simllms/Cargo.toml` and `crates/simllms-python/pyproject.toml` each
   declare an explicit `include` whitelist, so a packed artifact holds what it
