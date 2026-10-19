@@ -942,6 +942,7 @@ fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GeneratedImage", m.py().get_type::<PyGeneratedImage>())?;
     m.add("Warning", m.py().get_type::<PyWarning>())?;
     m.add("Capabilities", m.py().get_type::<PyCapabilities>())?;
+    m.add("CAPABILITY_FILTERS", CAPABILITY_FILTERS)?;
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(models_with, m)?)?;
     Ok(())

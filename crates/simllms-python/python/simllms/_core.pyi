@@ -90,6 +90,9 @@ def models_with(
 ) -> list[str]: ...
 
 
+CAPABILITY_FILTERS: tuple[str, ...]
+
+
 class ChatStream(Iterator[Chunk]):
     def __iter__(self) -> ChatStream: ...
     def __next__(self) -> Chunk: ...

@@ -141,7 +141,7 @@ class RetryPolicy:
 
 
 class Source(str, Enum):
-    """Where a :class:`Capabilities` record's authority comes from.
+    """The Capability Source: where a :class:`Capabilities` record comes from.
 
     ``CATALOG`` is the vendored snapshot, ``PROVIDER`` a machine-readable
     listing fetched from the provider, and ``USER`` a
@@ -183,7 +183,9 @@ class CapabilityOverrides:
     record reports :attr:`Source.USER`. Leaving a field as ``None``
     overrides nothing, so ``CapabilityOverrides()`` is a no-op. ``reasoning``
     takes ``"none"``, ``"toggle"``, or effort levels joined by ``+`` (e.g.
-    ``"low+high"``).
+    ``"low+high"``). ``image_input`` is the same Capability the query filter
+    ``supports_image_input`` and the :class:`Capabilities` field
+    ``input_modalities`` speak of.
     """
 
     image_input: bool | None = None
@@ -202,14 +204,9 @@ class CapabilityOverrides:
         }
 
 
-CAPABILITY_FILTERS = (
-    "tool_call",
-    "structured_output",
-    "image_generation",
-    "supports_image_input",
-    "reasoning",
-)
-"""The filter kwargs :func:`models_with` accepts."""
+CAPABILITY_FILTERS = tuple(_core.CAPABILITY_FILTERS)
+"""The filter kwargs :func:`models_with` accepts — enumerated on the Rust
+side, so there is one list to keep true."""
 
 
 def capabilities(provider: str, model: str) -> Capabilities | None:
@@ -330,7 +327,9 @@ class Client:
             base_url=base_url,
             options=options,
             capability_overrides=(
-                capability_overrides._to_core() if capability_overrides else None
+                capability_overrides._to_core()
+                if capability_overrides is not None
+                else None
             ),
             timeout=timeout,
             auth=auth_kwarg,

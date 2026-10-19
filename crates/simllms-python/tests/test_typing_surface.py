@@ -37,63 +37,47 @@ CASES = [
 ]
 
 
+def run_mypy(snippet: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    scratch = tmp_path / "snippet.py"
+    scratch.write_text(snippet, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--python-executable",
+            sys.executable,
+            "--no-error-summary",
+            "--cache-dir",
+            str(tmp_path / ".mypy_cache"),
+            str(scratch),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "snippet", "needle"),
     CASES,
     ids=[name for name, _, _ in CASES],
 )
 def test_mypy_rejects(name: str, snippet: str, needle: str, tmp_path: Path) -> None:
-    scratch = tmp_path / "snippet.py"
-    scratch.write_text(snippet, encoding="utf-8")
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "mypy",
-            "--python-executable",
-            sys.executable,
-            "--no-error-summary",
-            "--cache-dir",
-            str(tmp_path / ".mypy_cache"),
-            str(scratch),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=120,
-    )
+    completed = run_mypy(snippet, tmp_path)
 
     assert completed.returncode != 0, f"mypy accepted {name}:\n{completed.stdout}"
     assert needle in completed.stdout, completed.stdout
 
 
 def test_mypy_accepts_the_typed_surface(tmp_path: Path) -> None:
-    scratch = tmp_path / "snippet.py"
-    scratch.write_text(
+    completed = run_mypy(
         "from simllms import CapabilityOverrides, Client\n"
         'client = Client("deepseek", "m", api_key="sk", '
         "capability_overrides=CapabilityOverrides(image_input=True))\n"
         "assert client\n",
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "mypy",
-            "--python-executable",
-            sys.executable,
-            "--no-error-summary",
-            "--cache-dir",
-            str(tmp_path / ".mypy_cache"),
-            str(scratch),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=120,
+        tmp_path,
     )
 
     assert completed.returncode == 0, completed.stdout

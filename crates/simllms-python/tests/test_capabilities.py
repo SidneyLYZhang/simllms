@@ -74,6 +74,10 @@ def test_every_filter_kwarg_returns_sorted_ids() -> None:
 
 
 def test_filters_are_self_consistent_with_capabilities() -> None:
+    for model in models_with("deepseek", tool_call=True):
+        caps = capabilities("deepseek", model)
+        assert caps is not None
+        assert caps.tool_call is True
     for model in models_with("deepseek", structured_output=True):
         caps = capabilities("deepseek", model)
         assert caps is not None
@@ -82,6 +86,14 @@ def test_filters_are_self_consistent_with_capabilities() -> None:
         caps = capabilities("deepseek", model)
         assert caps is not None
         assert "image" in caps.input_modalities
+    for model in models_with("deepseek", reasoning=True):
+        caps = capabilities("deepseek", model)
+        assert caps is not None
+        assert caps.reasoning != "none"
+    for model in models_with("deepseek", image_generation=True):
+        caps = capabilities("deepseek", model)
+        assert caps is not None
+        assert caps.image_generation is True
 
 
 def test_a_false_filter_excludes_the_true_ones() -> None:
