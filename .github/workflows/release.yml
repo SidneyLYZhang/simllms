@@ -266,15 +266,51 @@ jobs:
           uv run --no-sync mypy python/simllms tests/test_client.py \
             tests/test_package_inventory.py tests/test_release_artifacts.py
 
-  publish-python:
-    name: Publish the wheels and the sdist to PyPI
+  publish:
+    name: Publish to both registries, then open the release page
     needs: [verify, inventory, seam]
     runs-on: ubuntu-latest
+    # The name appears once, here: the approval gate and both registry-side
+    # bindings are keyed to it, and `cargo xtask check-workflow` holds
+    # docs/releasing.md to the same word.
     environment: release
-    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
     permissions:
       id-token: write
+      contents: write
+    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
     steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The number may already be on the registry
+        id: crate
+        env:
+          SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        # The first Release publishes the crate by hand, because crates.io's
+        # Trusted Publishing cannot be bound to a crate that has never been
+        # published (docs/releasing.md). When the pipeline follows it, the number
+        # is already there — skip loudly rather than die on the registry's own
+        # refusal and drag Python down with it.
+        run: |
+          version="${SIMLLMS_RELEASE_TAG#v}"
+          if curl -fsSL "https://index.crates.io/si/ml/simllms" | grep -q "\"vers\":\"$version\""; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Exchange the runner's identity for a one-shot Cargo token
+        # Trusted publishing: the OIDC claim — repository, workflow file,
+        # environment, matched exactly — is the credential, so no long-lived
+        # token lives in this repository. This file is not a reusable workflow,
+        # because a reusable workflow cannot be a publisher at all (ADR-0006).
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish the crate
+        # cargo publishes a tree, not the inspected `.crate`; what stands in for
+        # the artifact is `verify`, which packs the same tree the same way and is
+        # held to it twice — `check-package` against the packager's own listing,
+        # and a `--dry-run` that compiles what it listed.
+        if: steps.crate.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p simllms
       # The Python half, named. Downloading *every* artifact of the run would put
       # the `.crate` in front of the PyPI uploader too, and the only reason that
       # is not an error is that the uploader skips extensions it does not
@@ -289,32 +325,20 @@ jobs:
           path: dist
           name: sdist
           merge-multiple: true
-      # Trusted publishing: the runner's OIDC token is the credential, so no PyPI
-      # token lives in this repository. The publisher binding is configured on
-      # PyPI before the first tag reaches this job.
+      # The registry's official publish action, and one job for wheels and sdist:
+      # a half upload is visible as the failure it is, and `skip-existing` is what
+      # makes a re-run after a half failure idempotent rather than a second
+      # version.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           path: dist
           skip-existing: true
-
-  publish-crate:
-    name: Publish the crate to crates.io
-    needs: [verify, inventory, seam]
-    runs-on: ubuntu-latest
-    environment: release
-    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Publish
-        # crates.io's trusted publishing reads this run's OIDC identity; the token
-        # here is deliberately absent, and the publisher binding is #21's setup.
-        #
-        # This is the one half of the release that repacks rather than uploading the
-        # inspected `.crate`: cargo has no path that publishes a file, only a tree.
-        # What stands in for the artifact is `verify`, which packs the same tree the
-        # same way and is held to it twice — `check-package` against the packager's
-        # own listing, and a `--dry-run` that compiles what it listed.
-        run: cargo publish -p simllms
+      - name: Open the release page
+        # The body is composed by `cargo xtask release-notes` from the changelog
+        # section and the vendored snapshot's own metadata, so the page cannot
+        # drift from what the release was checked against.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo xtask release-notes "${{ needs.verify.outputs.tag }}" > notes.md
+          gh release create "${{ needs.verify.outputs.tag }}" --title "simllms ${{ needs.verify.outputs.tag }}" --notes-file notes.md

@@ -145,6 +145,65 @@ fn is_dated(date: &str) -> bool {
             .all(|(part, width)| part.len() == width && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The body of a GitHub Release, composed from what the repository already
+/// declares: the changelog section for this version, the platforms the matrix
+/// owes a wheel to, and the Catalog Snapshot's own metadata — the date and the
+/// upstream commit the models in this Release were read from. Nothing here is
+/// written by hand at release time, because a Release page that can drift from
+/// the changelog is a second changelog.
+pub fn release_notes(changelog: &str, snapshot: &str, version: &str) -> Result<String, String> {
+    let problems = check_changelog(changelog, version);
+    if let Some(problem) = problems.first() {
+        return Err(problem.clone());
+    }
+    let section = changelog_section(changelog, version);
+    let meta = serde_json::from_str::<serde_json::Value>(snapshot)
+        .map_err(|error| format!("the Catalog Snapshot does not parse: {error}"))?;
+    let date = meta
+        .pointer("/meta/date")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "the Catalog Snapshot carries no `meta.date`".to_string())?;
+    let commit = meta
+        .pointer("/meta/commit")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "the Catalog Snapshot carries no `meta.commit`".to_string())?;
+    let platforms = WHEEL_PLATFORMS
+        .iter()
+        .map(|(label, _, _)| *label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "{section}\n\n\
+         Wheels: {platforms} — one `abi3` wheel per platform — plus the sdist \
+         and the crate, all carrying version {version}.\n\n\
+         Catalog Snapshot: {snapshot_date} (upstream commit `{commit}`).",
+        section = section.trim_end(),
+        snapshot_date = date.split('T').next().unwrap_or(date),
+    ))
+}
+
+/// The changelog's lines for one version: from its `## [version]` header to the
+/// next `## ` heading. The header line itself is dropped — the GitHub Release
+/// carries the version in its title, and a second copy of it would be a second
+/// place the number lives.
+fn changelog_section(changelog: &str, version: &str) -> String {
+    let header = format!("## [{version}]");
+    let mut lines = changelog
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|line| !line.starts_with(&header))
+        .skip(1)
+        .take_while(|line| !line.starts_with("## "));
+    let mut section: Vec<&str> = lines.by_ref().collect();
+    while section.first().is_some_and(|line| line.is_empty()) {
+        section.remove(0);
+    }
+    while section.last().is_some_and(|line| line.is_empty()) {
+        section.pop();
+    }
+    section.join("\n")
+}
+
 /// The rules the pull-request gate holds, as the release line has to hold them:
 /// every check `ci.yml` runs appears again in the release workflow. Read out of
 /// `ci` rather than listed here, so a new gate becomes a release requirement by
@@ -412,16 +471,7 @@ pub fn check_separation(text: &str) -> Vec<String> {
     }
     let mut publishers: Vec<&String> = Vec::new();
     for job in &jobs {
-        let body = job_body(text, job);
-        // A dry run of the packager publishes nothing, so it is not a publisher;
-        // it is the rehearsal of one.
-        let reaches_registry = lines_of(&body).iter().any(|line| {
-            (line.contains("gh-action-pypi-publish")
-                || line.contains("twine upload")
-                || (line.contains("cargo publish") && !line.contains("--dry-run")))
-                && !line.trim_start().starts_with('#')
-        });
-        if reaches_registry {
+        if reaches_registry(text, job) {
             publishers.push(job);
         }
     }
@@ -447,6 +497,200 @@ pub fn check_separation(text: &str) -> Vec<String> {
             problems.push(format!(
                 "the publishing job `{job}` runs whatever `{DRY_RUN_INPUT}` says — a rehearsal skips it *visibly*, because a job that is simply absent from a run proves nothing."
             ));
+        }
+    }
+    problems
+}
+
+/// The job that reaches a Registry, if the file has one: a step that uploads to
+/// PyPI, uploads with twine, or runs `cargo publish` without its `--dry-run`. A
+/// dry run of the packager publishes nothing, so it is not a publisher — it is
+/// the rehearsal of one.
+fn reaches_registry(text: &str, job: &str) -> bool {
+    lines_of(&job_body(text, job)).iter().any(|line| {
+        (line.contains("gh-action-pypi-publish")
+            || line.contains("twine upload")
+            || (line.contains("cargo publish") && !line.contains("--dry-run")))
+            && !line.trim_start().starts_with('#')
+    })
+}
+
+/// The approval environment the publisher stands behind, when exactly one job
+/// declares one. Publication is the one act a human approves, so the name is
+/// looked up from the file rather than repeated by every rule that needs it —
+/// and the runbook is held to the same name by [`check_runbook`].
+pub fn approval_environment(text: &str) -> Option<String> {
+    let environments: Vec<String> = mapping_keys(text, &["jobs"])
+        .iter()
+        .filter_map(|job| {
+            let value = scalar(text, &["jobs", job.as_str()], "environment");
+            value.first().cloned()
+        })
+        .collect();
+    if environments.len() == 1 {
+        environments.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// How publication happens, as the ticket holds it. One act, one approval: the
+/// crate first, then the Python distribution, both through the registries' own
+/// OpenID Connect so no long-lived token is stored anywhere, and never through a
+/// reusable workflow, which a Trusted Publishing publisher cannot be (ADR-0006).
+pub fn check_publication(text: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let jobs = mapping_keys(text, &["jobs"]);
+    let publishers: Vec<&String> = jobs
+        .iter()
+        .filter(|job| reaches_registry(text, job))
+        .collect();
+    if publishers.len() > 1 {
+        problems.push(format!(
+            "{} jobs reach a registry, so they may publish in either order or leave one registry holding a number the other refused — publication is one sequential act, the crate first, in a single job behind one approval.",
+            publishers.len()
+        ));
+        return problems;
+    }
+    let Some(job) = publishers.first() else {
+        return problems;
+    };
+    let body = code(&job_body(text, job));
+
+    let crate_step = body.lines().position(|line| line.contains("cargo publish"));
+    let python_step = body
+        .lines()
+        .position(|line| line.contains("gh-action-pypi-publish"));
+    match (crate_step, python_step) {
+        (Some(crate_step), Some(python_step)) if crate_step > python_step => problems.push(
+            "the Python distribution is uploaded before the crate — the crate goes first, so a half failure leaves Python unpublished rather than Python holding a number the crate refused.".to_string(),
+        ),
+        (None, _) => problems.push(
+            "no step publishes the crate, yet the job reaches a registry — the crate and the Python distribution release as one act, never apart.".to_string(),
+        ),
+        _ => {}
+    }
+
+    if !body.contains("crates-io-auth-action") {
+        problems.push(
+            "the crate is published without the registry's OpenID Connect exchange (`rust-lang/crates-io-auth-action`) — without it the job needs a stored token, and a long-lived credential in the repository outlives every review this line runs.".to_string(),
+        );
+    }
+    let id_token = scalar(text, &["jobs", job.as_str(), "permissions"], "id-token")
+        .first()
+        .cloned();
+    if id_token.as_deref() != Some("write") {
+        problems.push(
+            "the publishing job holds no `id-token: write` — the OIDC identity the registries match against is minted only for a job that asks for it.".to_string(),
+        );
+    }
+    if !body.contains("index.crates.io") {
+        problems.push(
+            "the crate is published unconditionally — the first Release publishes the crate by hand, before Trusted Publishing can be bound, so a pipeline that follows it republishes the same number and dies on the Registry's own refusal, skipping Python with it. Ask `index.crates.io` whether the number is already there and skip loudly when it is."
+                .to_string(),
+        );
+    }
+    if !body.contains("gh release create") || !body.contains("cargo xtask release-notes") {
+        problems.push(
+            "the job never creates the GitHub Release from `cargo xtask release-notes` — the page is part of the Release, and notes assembled by hand at the keyboard drift from the changelog the release was checked against.".to_string(),
+        );
+    }
+
+    for name in ["CARGO_REGISTRY_TOKEN", "TWINE_PASSWORD", "PYPI_API_TOKEN"] {
+        for line in lines_of(&job_body(text, job)) {
+            let Some(value) = line
+                .strip_prefix(&format!("{name}:"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != "''" && *value != "\"\"")
+            else {
+                continue;
+            };
+            if !value.contains("{{") || value.contains("secrets.") {
+                problems.push(format!(
+                    "`{name}` is set to `{value}` — a stored credential outlives every review, and the registries mint a short-lived one from the runner's OIDC identity instead."
+                ));
+            }
+        }
+    }
+
+    for used in values_of_key(text, "uses") {
+        if used.starts_with("./") {
+            problems.push(format!(
+                "`uses: {used}` calls a reusable workflow — a reusable workflow cannot be a Trusted Publishing publisher, so the publication steps live in this file where the registries' exact-match binding can see them (ADR-0006)."
+            ));
+        }
+    }
+    if approval_environment(text).is_none() {
+        problems.push(
+            "the approval environment is declared by zero or several jobs — the name appears once in the workflow, on the job that publishes, so the one human approval covers the one act that needs it.".to_string(),
+        );
+    }
+    problems
+}
+
+/// The runbook the first Release is executed from, held to the workflow it
+/// serves: the approval environment is named once here and once there, and the
+/// sections a person meets in order are present in that order. A runbook that
+/// drifts from the workflow sends the person shipping v0.1.0 off the steps the
+/// registries were configured for.
+pub const RUNBOOK: &str = "docs/releasing.md";
+
+/// The runbook's sections, in the order the first Release meets them: the
+/// one-time setup the registries force, then the act itself, then what to do
+/// when it goes wrong.
+const RUNBOOK_SECTIONS: &[&str] = &[
+    "Verify the registry account email",
+    "Create the approval environment",
+    "Bind the pending Python publisher",
+    "Publish the crate once with a short-lived token",
+    "Revoke the token",
+    "Bind the crate's trusted publisher",
+    "Cut a release",
+    "When a release half-fails",
+    "Yank a release",
+    "After a release",
+];
+
+pub fn check_runbook(workflow: &str, runbook: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Some(environment) = approval_environment(workflow) {
+        let declared = runbook.lines().any(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("Environment name: ")
+                .map(str::trim);
+            value.is_some_and(|value| value.trim_matches('`') == environment)
+        });
+        if !declared {
+            problems.push(format!(
+                "`{RUNBOOK}` never states `Environment name: {environment}` — the Registry-side bindings are keyed to that name, and a runbook that disagrees with the workflow sends the approval to an environment the registries have never heard of."
+            ));
+        }
+    }
+    let headings: Vec<String> = RUNBOOK_SECTIONS
+        .iter()
+        .map(|section| format!("## {section}"))
+        .collect();
+    let positions: Vec<Option<usize>> = headings
+        .iter()
+        .map(|heading| runbook.lines().position(|line| line.trim() == *heading))
+        .collect();
+    for (section, position) in RUNBOOK_SECTIONS.iter().zip(&positions) {
+        if position.is_none() {
+            problems.push(format!(
+                "`{RUNBOOK}` never explains `{section}` — the first Release is executed from this file, not from memory."
+            ));
+        }
+    }
+    for (index, pair) in positions.windows(2).enumerate() {
+        if let (Some(before), Some(after)) = (pair[0], pair[1]) {
+            if before > after {
+                problems.push(format!(
+                    "`{RUNBOOK}` explains `{}` after `{}` — a person meets the sections as the first Release meets them.",
+                    RUNBOOK_SECTIONS[index],
+                    RUNBOOK_SECTIONS[index + 1]
+                ));
+            }
         }
     }
     problems
@@ -646,7 +890,16 @@ fn values_of_key(text: &str, key: &str) -> Vec<String> {
         if line.starts_with('#') {
             continue;
         }
-        let Some(value) = line.strip_prefix(prefix.as_str()).map(str::trim) else {
+        // A mapping value can sit in a list item — every step's `uses:` is
+        // written `- uses: …` — so the item marker is part of the same read.
+        let Some(value) = line
+            .strip_prefix(prefix.as_str())
+            .or_else(|| {
+                line.strip_prefix("- ")
+                    .and_then(|rest| rest.strip_prefix(prefix.as_str()))
+            })
+            .map(str::trim)
+        else {
             continue;
         };
         if !value.is_empty() && !value.contains("{{") {
@@ -884,28 +1137,54 @@ jobs:
       - run: uv run --no-sync pytest tests
       - run: uv run --no-sync mypy python/simllms tests
 
-  publish-python:
+  publish:
     needs: [verify, inventory, seam]
     runs-on: ubuntu-latest
     environment: release
-    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
     permissions:
       id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository: pypi
-          skip-existing: true
-
-  publish-crate:
-    needs: [verify, inventory, seam]
-    runs-on: ubuntu-latest
-    environment: release
+      contents: write
     if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
     steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The number may already be on the registry
+        id: crate
+        env:
+          SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          version="${SIMLLMS_RELEASE_TAG#v}"
+          if curl -fsSL "https://index.crates.io/si/ml/simllms" | grep -q "\"vers\":\"$version\""; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Exchange the runner's identity for a one-shot Cargo token
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish the crate
+        if: steps.crate.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p simllms
       - uses: actions/download-artifact@v4
-      - run: cargo publish --no-verify -p simllms
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: sdist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          path: dist
+          skip-existing: true
+      - name: The release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo xtask release-notes "${{ needs.verify.outputs.tag }}" > notes.md
+          gh release create "${{ needs.verify.outputs.tag }}" --title "simllms ${{ needs.verify.outputs.tag }}" --notes-file notes.md
 "#;
 
     const CI: &str = r#"
@@ -1256,14 +1535,14 @@ jobs:
     #[test]
     fn a_publisher_that_computes_instead_of_consuming_artifacts_is_named() {
         let merged = RELEASE.replace(
-            "  publish-crate:\n    needs: [verify, inventory, seam]\n    runs-on: ubuntu-latest\n    environment: release\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
-            "  publish-crate:\n    runs-on: ubuntu-latest\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
+            "  publish:\n    needs: [verify, inventory, seam]\n    runs-on: ubuntu-latest\n    environment: release\n",
+            "  publish:\n    runs-on: ubuntu-latest\n",
         );
         let problems = check_separation(&merged);
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("no GitHub environment") && p.contains("publish-crate")),
+                .any(|p| p.contains("no GitHub environment") && p.contains("`publish`")),
             "{problems:?}"
         );
         assert!(
@@ -1275,12 +1554,14 @@ jobs:
     #[test]
     fn a_publisher_that_ignores_the_rehearsal_is_named() {
         let silent = RELEASE.replace(
-            "    environment: release\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n    permissions:",
-            "    environment: release\n    permissions:",
+            "      contents: write\n    if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'\n",
+            "      contents: write\n",
         );
         let problems = check_separation(&silent);
         assert!(
-            problems.iter().any(|p| p.contains("publish-python")),
+            problems
+                .iter()
+                .any(|p| p.contains("the publishing job `publish`")),
             "{problems:?}"
         );
     }
@@ -1481,6 +1762,197 @@ jobs:
     }
 
     #[test]
+    fn publication_is_one_sequential_act() {
+        assert!(
+            check_publication(RELEASE).is_empty(),
+            "{:?}",
+            check_publication(RELEASE)
+        );
+
+        // Two publishers can go in either order, or leave one registry holding a
+        // number the other refused.
+        let two = format!(
+            "{RELEASE}\n  publish-too:\n    needs: seam\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo publish -p simllms\n"
+        );
+        let problems = check_publication(&two);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("one sequential act"),
+            "{}",
+            problems[0]
+        );
+
+        // The crate goes first, so a half failure leaves Python unpublished.
+        let reversed = "jobs:\n  publish:\n    needs: seam\n    steps:\n      - uses: pypa/gh-action-pypi-publish@release/v1\n      - run: cargo publish -p simllms\n";
+        let problems = check_publication(reversed);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("before the crate")
+                    || p.contains("Python distribution is uploaded")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_crate_is_published_through_an_exchange_not_a_stored_token() {
+        let stored = RELEASE.replace(
+            "CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}",
+            "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}",
+        );
+        let problems = check_publication(&stored);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("CARGO_REGISTRY_TOKEN") && p.contains("stored credential")),
+            "{problems:?}"
+        );
+
+        let literal = RELEASE.replace(
+            "CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}",
+            "CARGO_REGISTRY_TOKEN: eyJhbGciOi",
+        );
+        let problems = check_publication(&literal);
+        assert!(
+            problems.iter().any(|p| p.contains("CARGO_REGISTRY_TOKEN")),
+            "{problems:?}"
+        );
+
+        let no_exchange = RELEASE.replace(
+            "uses: rust-lang/crates-io-auth-action@v1",
+            "uses: actions/checkout@v4",
+        );
+        let problems = check_publication(&no_exchange);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates-io-auth-action") && p.contains("OpenID Connect")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_first_release_is_not_republished_by_the_pipeline() {
+        // The runbook publishes the crate by hand before Trusted Publishing can
+        // be bound; a pipeline that follows it must not die on the registry's
+        // refusal and drag Python down with it.
+        let unguarded = RELEASE.replace(
+            "          if curl -fsSL \"https://index.crates.io/si/ml/simllms\" | grep -q \"\\\"vers\\\":\\\"$version\\\"\"; then\n            echo \"published=true\" >> \"$GITHUB_OUTPUT\"\n          fi\n",
+            "",
+        );
+        let problems = check_publication(&unguarded);
+        assert!(
+            problems.iter().any(|p| p.contains("index.crates.io")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_release_page_is_part_of_the_release() {
+        let handwritten = RELEASE.replace(
+            "          cargo xtask release-notes \"${{ needs.verify.outputs.tag }}\" > notes.md\n          gh release create \"${{ needs.verify.outputs.tag }}\" --title \"simllms ${{ needs.verify.outputs.tag }}\" --notes-file notes.md\n",
+            "",
+        );
+        let problems = check_publication(&handwritten);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("release-notes") && p.contains("GitHub Release")),
+            "{problems:?}"
+        );
+
+        // A reusable workflow cannot be a Trusted Publishing publisher, so the
+        // publication steps must be this file's own.
+        let delegated = RELEASE.replace(
+            "      - uses: dtolnay/rust-toolchain@stable\n",
+            "      - uses: ./.github/workflows/publish.yml\n      - uses: dtolnay/rust-toolchain@stable\n",
+        );
+        let problems = check_publication(&delegated);
+        assert!(
+            problems.iter().any(|p| p.contains("reusable workflow")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_runbook_and_the_workflow_name_one_environment() {
+        let runbook = format!(
+            "Environment name: release\n\n{}",
+            RUNBOOK_SECTIONS
+                .iter()
+                .map(|section| format!("## {section}\n\nThe steps.\n\n"))
+                .collect::<String>()
+        );
+        assert!(
+            check_runbook(RELEASE, &runbook).is_empty(),
+            "{:?}",
+            check_runbook(RELEASE, &runbook)
+        );
+
+        let disagreeing = runbook.replace("Environment name: release", "Environment name: prod");
+        let problems = check_runbook(RELEASE, &disagreeing);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("Environment name: release")),
+            "{problems:?}"
+        );
+
+        let undated = runbook.replace("## Yank a release\n", "");
+        let problems = check_runbook(RELEASE, &undated);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("never explains `Yank a release`")),
+            "{problems:?}"
+        );
+
+        let reordered = runbook
+            .replace("## Bind the pending Python publisher\n", "")
+            .replace(
+                "## After a release\n",
+                "## Bind the pending Python publisher\n## After a release\n",
+            );
+        let problems = check_runbook(RELEASE, &reordered);
+        assert!(
+            problems.iter().any(|p| {
+                p.contains("`Bind the pending Python publisher` after")
+                    && p.contains("`Publish the crate once with a short-lived token`")
+            }),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_release_notes_are_read_from_the_changelog_and_the_snapshot() {
+        let changelog = "# Changelog\n\n## [Unreleased]\n\n- Nothing yet.\n\n## [0.1.0] - 2026-10-19\n\n- The whole release line.\n";
+        let snapshot = r#"{"meta":{"commit":"5ad99719fd79075d1afb5aa99a30f80c7e1f7eb5","date":"2026-10-15T08:35:51Z"}}"#;
+        let notes = release_notes(changelog, snapshot, "0.1.0").expect("notes");
+        assert!(notes.starts_with("- The whole release line."), "{notes}");
+        assert!(notes.contains("Wheels: manylinux x86_64, manylinux aarch64, macOS x86_64, macOS arm64, Windows amd64"), "{notes}");
+        assert!(
+            notes.contains("Catalog Snapshot: 2026-10-15 (upstream commit `5ad99719fd79075d1afb5aa99a30f80c7e1f7eb5`)."),
+            "{notes}"
+        );
+        // The header stays out: the page title already carries the number.
+        assert!(!notes.contains("## [0.1.0]"), "{notes}");
+        assert!(!notes.contains("[Unreleased]"), "{notes}");
+
+        let undated = changelog.replace("## [0.1.0] - 2026-10-19", "## [0.1.0]");
+        assert!(
+            release_notes(&undated, snapshot, "0.1.0")
+                .expect_err("an undated section is not a release")
+                .contains("without a date"),
+        );
+        let unmeta = r#"{"meta":{}}"#;
+        assert!(
+            release_notes(changelog, unmeta, "0.1.0")
+                .expect_err("a snapshot without metadata is not a snapshot")
+                .contains("meta.date"),
+        );
+    }
+
+    #[test]
     fn a_manylinux_row_with_no_named_image_is_a_row_with_no_baseline() {
         // Both manylinux rows name an image. Drop one image and the row is still
         // syntactically fine — it just builds inside the builder's default, and
@@ -1548,8 +2020,7 @@ jobs:
                 "distributions",
                 "inventory",
                 "seam",
-                "publish-python",
-                "publish-crate"
+                "publish"
             ]
         );
         assert_eq!(
@@ -1561,7 +2032,7 @@ jobs:
             vec!["v*".to_string()]
         );
         assert_eq!(
-            scalar(RELEASE, &["jobs", "publish-crate"], "needs"),
+            scalar(RELEASE, &["jobs", "publish"], "needs"),
             vec![
                 "verify".to_string(),
                 "inventory".to_string(),
@@ -1569,14 +2040,14 @@ jobs:
             ]
         );
         assert_eq!(
-            scalar(RELEASE, &["jobs", "publish-python"], "environment"),
+            scalar(RELEASE, &["jobs", "publish"], "environment"),
             vec!["release".to_string()]
         );
         assert!(scalar(RELEASE, &["jobs", "verify"], "environment").is_empty());
         assert!(block(RELEASE, &["jobs", "nope"]).is_none());
         // A condition keeps the quotes inside it; only a wrapped scalar loses them.
         assert_eq!(
-            scalar(RELEASE, &["jobs", "publish-crate"], "if")[0],
+            scalar(RELEASE, &["jobs", "publish"], "if")[0],
             "github.event_name == 'push' || github.event.inputs.dry_run != 'true'"
         );
     }

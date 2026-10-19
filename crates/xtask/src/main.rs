@@ -46,14 +46,15 @@ fn main() {
         Some("check-docs") => check_docs(),
         Some("check-workflow") => check_workflow(),
         Some("release-tag") => release_tag(),
+        Some("release-notes") => release_notes(std::env::args().skip(2)),
         Some("check-release") => check_release(std::env::args().skip(2)),
         Some("check-artifacts") => check_artifacts(std::env::args().skip(2)),
         _ => {
             eprintln!(
                 "usage: cargo xtask refresh-catalog [--check] | sync-version [--check] | \
                  sync-package [--check] | check-package [--crate-listing <file|->] | check-docs | \
-                 check-workflow | release-tag | check-release <tag> [--commit <sha>] | \
-                 check-artifacts <dir> --tag <tag>"
+                 check-workflow | release-tag | release-notes <tag> | \
+                 check-release <tag> [--commit <sha>] | check-artifacts <dir> --tag <tag>"
             );
             std::process::exit(2);
         }
@@ -74,6 +75,29 @@ fn authoritative_version() -> String {
 /// here rather than becoming a shell `grep` of `Cargo.toml`.
 fn release_tag() {
     println!("v{}", authoritative_version());
+}
+
+/// The GitHub Release body for a tag, on stdout. Composed by [`release::release_notes`]
+/// from the changelog and the vendored snapshot, so the workflow never assembles
+/// prose out of shell.
+fn release_notes(args: impl Iterator<Item = String>) {
+    let Some(tag) = args.collect::<Vec<String>>().first().map(String::clone) else {
+        eprintln!("usage: cargo xtask release-notes <vX.Y.Z>");
+        std::process::exit(2);
+    };
+    let Some(version) = release::tag_version(&tag) else {
+        eprintln!(
+            "`{tag}` is not a release tag — the body belongs to a version, and `vX.Y.Z` names one."
+        );
+        std::process::exit(2);
+    };
+    let changelog = read(&path(release::CHANGELOG));
+    let snapshot = read(&path("catalog/modelsdev-snapshot.json"));
+    let notes = release::release_notes(&changelog, &snapshot, version).unwrap_or_else(|problem| {
+        eprintln!("{problem}");
+        std::process::exit(1);
+    });
+    println!("{notes}");
 }
 
 /// Is this tag allowed to become a release? Every rule is named by the check that
@@ -177,9 +201,14 @@ fn check_workflow() {
             problems.extend(release::check_dispatch(&text));
             problems.extend(release::check_matrix(&text));
             problems.extend(release::check_separation(&text));
+            problems.extend(release::check_publication(&text));
             problems.extend(release::check_gate_parity(&ci, &text));
             problems.extend(release::check_invoked_gates(&text));
             problems.extend(release::check_seam_environment(&text));
+            problems.extend(release::check_runbook(
+                &text,
+                &read_copy(&path(release::RUNBOOK)).unwrap_or_default(),
+            ));
             problems
         }
     };

@@ -41,9 +41,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   x86_64 and aarch64 from pinned `manylinux_2_28` images, the latter
   cross-compiled rather than emulated, macOS x86_64 and arm64 as two separate
   wheels, Windows amd64); the crate and the sdist come from their own packagers;
-  and only `publish-python` and `publish-crate` — each behind the shared
-  approval environment and an explicit `dry_run` test — reach a registry. A
-  rehearsal skips those two visibly rather than leaving them out of the run.
+  and only the `publish` job — behind the shared approval environment and an
+  explicit `dry_run` test — reaches a registry. A rehearsal skips it visibly
+  rather than leaving it out of the run.
+- **Publication is one sequential act behind one approval.** The `publish` job
+  exchanges the runner's OpenID Connect identity for a one-shot Cargo token
+  (`rust-lang/crates-io-auth-action`), publishes the crate first, then the
+  wheels and the sdist through the registry's official action, then opens the
+  GitHub Release page. No long-lived registry credential is stored anywhere, no
+  reusable workflow stands in for the publication steps (a reusable workflow
+  cannot be a Trusted Publishing publisher — ADR-0006), and the crate step asks
+  `index.crates.io` whether the number is already there and skips loudly when it
+  is, because the first Release publishes the crate by hand before crates.io's
+  publisher binding can exist.
+- `cargo xtask release-notes <tag>` composes the GitHub Release body from the
+  changelog's dated section and the vendored Catalog Snapshot's own metadata —
+  its date and upstream commit — plus the platform list the matrix owes a wheel
+  to, so the page is read from the repository instead of typed on release day.
+- **The first Release is executed from a runbook, not from memory.**
+  `docs/releasing.md` walks the one-time setup in the order the registries force
+  it (verify the account email, create the approval environment, bind the
+  pending Python publisher, publish the crate once with a short-lived token,
+  revoke it, bind the crate's trusted publisher), then the tag procedure, the
+  Forward Fix policy, yank as human steps only, and the post-release restoration
+  of `[Unreleased]`. `cargo xtask check-workflow` holds the runbook to the
+  workflow: the approval environment is named in both, and the sections are
+  checked to exist in that order. The decisions behind publication are recorded
+  in ADR-0006 (trusted publishing) and ADR-0007 (the Authoritative Version).
 - `cargo xtask check-release <tag>` refuses a tag with a pre-release or build
   suffix, a tag whose number differs from the Authoritative Version, a tag on a
   commit that has not landed on `main`, and a version the changelog holds no
