@@ -178,16 +178,22 @@ jobs:
         # this job just planted, and the plant is the proof that an ignored
         # directory cannot reach an archive — so it stays, and the venv goes.
         run: uv build --sdist --out-dir dist
-      - name: Name the artifacts
-        run: |
-          echo "SIMLLMS_CRATE=$(realpath target/package/simllms-*.crate)" >> "$GITHUB_ENV"
-          echo "SIMLLMS_SDIST=$(realpath crates/simllms-python/dist/simllms-*.tar.gz)" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - name: Upload the crate
+        # Two artifacts, not one: `upload-artifact` stores paths relative to the
+        # tree they share, and these two share the repository root. As one
+        # artifact the run handed the inventory `target/` and `crates/`
+        # directories where the archives were meant to be — and a directory is
+        # not an artifact. One glob each keeps both flat.
+        uses: actions/upload-artifact@v4
         with:
-          name: distributions
-          path: |
-            target/package/simllms-*.crate
-            crates/simllms-python/dist/simllms-*.tar.gz
+          name: crate
+          path: target/package/simllms-*.crate
+          if-no-files-found: error
+      - name: Upload the sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/simllms-python/dist/simllms-*.tar.gz
           if-no-files-found: error
 
   inventory:
@@ -261,9 +267,19 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # The Python half, named. Downloading *every* artifact of the run would put
+      # the `.crate` in front of the PyPI uploader too, and the only reason that
+      # is not an error is that the uploader skips extensions it does not
+      # recognise — a silence nobody wrote down and nothing checks.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: sdist
           merge-multiple: true
       # Trusted publishing: the runner's OIDC token is the credential, so no PyPI
       # token lives in this repository. The publisher binding is configured on
