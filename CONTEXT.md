@@ -22,6 +22,10 @@ _Avoid_: Model name, slug
 The provider-independent identity that several Model Ids across providers stand for. A catalog notion used for cross-references and suggestions, never something a caller passes.
 _Avoid_: Global model id, base model
 
+**Decision Model**:
+A model class that answers a predefined set of typed questions about a supplied state and returns calibrated probabilities, generating no natural language. A different class from Chat, gated by its own Capability.
+_Avoid_: Judge model, classifier, fast LLM
+
 ### What a model can do
 
 **Capability**:
