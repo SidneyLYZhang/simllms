@@ -80,8 +80,8 @@ fn release_tag() {
 /// The GitHub Release body for a tag, on stdout. Composed by [`release::release_notes`]
 /// from the changelog and the vendored snapshot, so the workflow never assembles
 /// prose out of shell.
-fn release_notes(args: impl Iterator<Item = String>) {
-    let Some(tag) = args.collect::<Vec<String>>().first().map(String::clone) else {
+fn release_notes(mut args: impl Iterator<Item = String>) {
+    let Some(tag) = args.next() else {
         eprintln!("usage: cargo xtask release-notes <vX.Y.Z>");
         std::process::exit(2);
     };
@@ -92,7 +92,7 @@ fn release_notes(args: impl Iterator<Item = String>) {
         std::process::exit(2);
     };
     let changelog = read(&path(release::CHANGELOG));
-    let snapshot = read(&path("catalog/modelsdev-snapshot.json"));
+    let snapshot = read(&path(release::SNAPSHOT));
     let notes = release::release_notes(&changelog, &snapshot, version).unwrap_or_else(|problem| {
         eprintln!("{problem}");
         std::process::exit(1);

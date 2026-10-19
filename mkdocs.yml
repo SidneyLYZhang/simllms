@@ -38,12 +38,15 @@ nav:
   - 自定义网关: custom-gateway.md
   - 路线图: roadmap.md
   - 变更日志: changelog.md
+  - 发布 runbook: releasing.md
   - 架构决策 / ADR:
       - 0001: adr/0001-core-crate-never-links-python.md
       - 0002: adr/0002-capability-catalog-three-layers.md
       - 0003: adr/0003-python-asyncclient-bridges-threads.md
       - 0004: adr/0004-structured-output-is-native-only.md
       - 0005: adr/0005-unknown-model-ids-warn-and-pass.md
+      - 0006: adr/0006-publication-authenticates-through-trusted-publishing.md
+      - 0007: adr/0007-the-workspace-version-is-the-authoritative-version.md
 
 markdown_extensions:
   - admonition

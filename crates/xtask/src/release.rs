@@ -14,6 +14,7 @@
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 pub const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 pub const CHANGELOG: &str = "CHANGELOG.md";
+pub const SNAPSHOT: &str = "catalog/modelsdev-snapshot.json";
 
 /// The manylinux baseline the wheel matrix is built inside, named once so the pin
 /// in the workflow and the tag on the artifact are checked against one number. A
@@ -653,19 +654,21 @@ const RUNBOOK_SECTIONS: &[&str] = &[
 
 pub fn check_runbook(workflow: &str, runbook: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    if let Some(environment) = approval_environment(workflow) {
-        let declared = runbook.lines().any(|line| {
-            let value = line
-                .trim()
-                .strip_prefix("Environment name: ")
-                .map(str::trim);
-            value.is_some_and(|value| value.trim_matches('`') == environment)
-        });
-        if !declared {
-            problems.push(format!(
-                "`{RUNBOOK}` never states `Environment name: {environment}` — the Registry-side bindings are keyed to that name, and a runbook that disagrees with the workflow sends the approval to an environment the registries have never heard of."
-            ));
+    match approval_environment(workflow) {
+        Some(environment) => {
+            let declared = runbook.lines().any(|line| {
+                let value = line.trim().strip_prefix("Environment name: ").map(str::trim);
+                value.is_some_and(|value| value.trim_matches('`') == environment)
+            });
+            if !declared {
+                problems.push(format!(
+                    "`{RUNBOOK}` never states `Environment name: {environment}` — the Registry-side bindings are keyed to that name, and a runbook that disagrees with the workflow sends the approval to an environment the registries have never heard of."
+                ));
+            }
         }
+        None => problems.push(format!(
+            "`{RELEASE_WORKFLOW}` declares no approval environment for exactly one job — there is no name to hold `{RUNBOOK}` to, and the runbook's Registry-side bindings must key to the name the publishing job declares."
+        )),
     }
     let headings: Vec<String> = RUNBOOK_SECTIONS
         .iter()
@@ -1919,6 +1922,17 @@ jobs:
                 p.contains("`Bind the pending Python publisher` after")
                     && p.contains("`Publish the crate once with a short-lived token`")
             }),
+            "{problems:?}"
+        );
+
+        // Fails closed: a workflow that lost its single environment cannot
+        // silently drop the agreement check.
+        let no_environment = RELEASE.replace("    environment: release\n", "");
+        let problems = check_runbook(&no_environment, &runbook);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("declares no approval environment")),
             "{problems:?}"
         );
     }

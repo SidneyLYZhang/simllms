@@ -341,4 +341,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cargo xtask release-notes "${{ needs.verify.outputs.tag }}" > notes.md
-          gh release create "${{ needs.verify.outputs.tag }}" --title "simllms ${{ needs.verify.outputs.tag }}" --notes-file notes.md
+          # The crate guard asks the index; this one asks GitHub. A re-run after
+          # a failure past PyPI meets a page that already exists and leaves it.
+          if gh release view "${{ needs.verify.outputs.tag }}" > /dev/null 2>&1; then
+            echo "the release page already exists — leaving it as it is"
+          else
+            gh release create "${{ needs.verify.outputs.tag }}" --title "simllms ${{ needs.verify.outputs.tag }}" --notes-file notes.md
+          fi
