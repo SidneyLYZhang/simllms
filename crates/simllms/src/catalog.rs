@@ -2,6 +2,15 @@ use crate::capabilities::{Capabilities, ResolvedCapabilities, Source};
 use crate::catalog_data;
 use crate::provider::Provider;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// The builtin catalog, built once and shared: every `Client` resolves
+/// against this table unless told otherwise, and so do the module-level
+/// query entry points.
+pub fn shared() -> &'static Catalog {
+    static SHARED: OnceLock<Catalog> = OnceLock::new();
+    SHARED.get_or_init(Catalog::builtin)
+}
 
 /// The built-in table of Models and their Capabilities, generated from the
 /// vendored models.dev snapshot plus hand-maintained image-generation

@@ -1,12 +1,16 @@
 """Type hints for `simllms._core` (the pyo3 extension module).
 
 The stub mirrors the Rust surface: Client kwargs, Reply/Chunk/GeneratedImage/
-Warning attributes, and the exception attributes map_error attaches (model/
-missing/suggestions on CapabilityError; status/provider_message/raw_body on
-APIError). The primitive shapes of `auth`, `dashscope_region` and `retry`
-are what the pure-Python layer sends after decomposing its dataclasses:
-`("bearer",)` or a `("header", name, value)` triple; `"cn"`, `"singapore"`
-or a `("workspace", id, region)` triple; an `(enabled, max_attempts)` pair.
+Warning/Capabilities attributes, the exception attributes map_error attaches
+(model/missing/suggestions on CapabilityError; status/provider_message/
+raw_body on APIError), and the module-level catalog queries. The primitive
+shapes of `auth`, `dashscope_region` and `retry` are what the pure-Python
+layer sends after decomposing its dataclasses: `("bearer",)` or a
+`("header", name, value)` triple; `"cn"`, `"singapore"` or a
+`("workspace", id, region)` triple; an `(enabled, max_attempts)` pair. The
+pure-Python layer re-exports `Capabilities`' fields as a frozen dataclass;
+this pyclass is the wire form, `capability_overrides` here stays a dict of
+only-set fields because the typed object never crosses this boundary.
 """
 
 from typing import Any, Iterator, Sequence
@@ -63,6 +67,27 @@ class Warning:
     kind: str
     provider: str | None
     model: str
+
+
+class Capabilities:
+    source: str
+    input_modalities: list[str]
+    structured_output: bool
+    tool_call: bool
+    image_generation: bool
+    reasoning: str
+    reasoning_levels: list[str]
+    context_window: int | None
+    max_output_tokens: int | None
+    status: str
+
+
+def capabilities(provider: str, model: str) -> Capabilities | None: ...
+
+
+def models_with(
+    provider: str, filters: dict[str, bool] | None = None
+) -> list[str]: ...
 
 
 class ChatStream(Iterator[Chunk]):

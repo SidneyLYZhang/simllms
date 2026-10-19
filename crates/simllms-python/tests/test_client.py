@@ -26,6 +26,7 @@ from simllms import (
     AsyncClient,
     Auth,
     CapabilityError,
+    CapabilityOverrides,
     Client,
     ConfigError,
     DashScopeRegion,
@@ -410,7 +411,7 @@ def test_structured_output_refusal_surfaces_locally() -> None:
         "deepseek-v4-pro",
         api_key="sk-test",
         base_url="http://127.0.0.1:1",
-        capability_overrides={"structured_output": False},
+        capability_overrides=CapabilityOverrides(structured_output=False),
     )
     schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
 

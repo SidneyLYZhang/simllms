@@ -77,9 +77,9 @@ missing capability ImageInput; capable models on this provider: deepseek-v4-flas
 
 三种放行方式（按优先级 用户声明 > 提供商自述 > 目录）：
 
-1. **确实该放行**：你比目录更了解模型——在客户端上声明覆盖：
-   `Client(..., capability_overrides={"image_input": True})`（Python）/
-   `with_capability_overrides`（Rust）。
+1. **确实该放行**：你比目录更了解模型——在客户端上声明类型化覆盖：
+   `Client(..., capability_overrides=CapabilityOverrides(image_input=True))`
+   （Python）/ `with_capability_overrides`（Rust）。
 2. **未知模型**：不在目录里的模型 id（比如网关上的新模型）是
    warn-and-pass（ADR-0005）——请求照发；还能先用 `warnings()`（两种
    语言都有）预览那条警告。

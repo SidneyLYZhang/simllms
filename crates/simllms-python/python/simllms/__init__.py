@@ -11,9 +11,11 @@ handler to that name to hear it. No credentials are ever logged.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal, cast
 
 from simllms import _core
@@ -32,7 +34,9 @@ __all__ = [
     "APIError",
     "AsyncClient",
     "Auth",
+    "Capabilities",
     "CapabilityError",
+    "CapabilityOverrides",
     "Chunk",
     "Client",
     "ConfigError",
@@ -42,8 +46,11 @@ __all__ = [
     "Reply",
     "RetryPolicy",
     "SimLLMError",
+    "Source",
     "TransportError",
     "Warning",
+    "capabilities",
+    "models_with",
     "__version__",
 ]
 
@@ -133,6 +140,121 @@ class RetryPolicy:
         return RetryPolicy(max_attempts=1)
 
 
+class Source(str, Enum):
+    """Where a :class:`Capabilities` record's authority comes from.
+
+    ``CATALOG`` is the vendored snapshot, ``PROVIDER`` a machine-readable
+    listing fetched from the provider, and ``USER`` a
+    :class:`CapabilityOverrides` statement (which outranks both — ADR-0005).
+    """
+
+    CATALOG = "catalog"
+    PROVIDER = "provider"
+    USER = "user"
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What the Catalog (or an override) says a model can do.
+
+    ``input_modalities`` is ``("text",)`` or ``("text", "image")``;
+    ``reasoning`` is ``"none"``, ``"toggle"``, or ``"effort"`` — with the
+    accepted effort levels in ``reasoning_levels``; ``status`` is
+    ``"active"`` or ``"deprecated"``.
+    """
+
+    source: Source
+    input_modalities: tuple[str, ...]
+    structured_output: bool
+    tool_call: bool
+    image_generation: bool
+    reasoning: str
+    reasoning_levels: tuple[str, ...]
+    context_window: int | None
+    max_output_tokens: int | None
+    status: str
+
+
+@dataclass(frozen=True)
+class CapabilityOverrides:
+    """Field-level capability statements that outrank the Catalog.
+
+    ADR-0005: the user can tighten or relax the Gate, and the resulting
+    record reports :attr:`Source.USER`. Leaving a field as ``None``
+    overrides nothing, so ``CapabilityOverrides()`` is a no-op. ``reasoning``
+    takes ``"none"``, ``"toggle"``, or effort levels joined by ``+`` (e.g.
+    ``"low+high"``).
+    """
+
+    image_input: bool | None = None
+    structured_output: bool | None = None
+    tool_call: bool | None = None
+    image_generation: bool | None = None
+    reasoning: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+
+    def _to_core(self) -> dict[str, Any]:
+        return {
+            field: value
+            for field, value in dataclasses.asdict(self).items()
+            if value is not None
+        }
+
+
+CAPABILITY_FILTERS = (
+    "tool_call",
+    "structured_output",
+    "image_generation",
+    "supports_image_input",
+    "reasoning",
+)
+"""The filter kwargs :func:`models_with` accepts."""
+
+
+def capabilities(provider: str, model: str) -> Capabilities | None:
+    """What the Catalog knows about ``(provider, model)``.
+
+    ``None`` is the unknown-Model-Id answer (ADR-0005: warn-and-pass is a
+    query result, not an exception). Answered from the vendored snapshot
+    alone — no network call.
+    """
+    core = _core.capabilities(provider, model)
+    if core is None:
+        return None
+    return Capabilities(
+        source=Source(core.source),
+        input_modalities=tuple(core.input_modalities),
+        structured_output=core.structured_output,
+        tool_call=core.tool_call,
+        image_generation=core.image_generation,
+        reasoning=core.reasoning,
+        reasoning_levels=tuple(core.reasoning_levels),
+        context_window=core.context_window,
+        max_output_tokens=core.max_output_tokens,
+        status=core.status,
+    )
+
+
+def models_with(provider: str, **filters: bool) -> list[str]:
+    """Ids of the provider's cataloged models matching every filter, sorted.
+
+    Filters are the names in :data:`CAPABILITY_FILTERS`, each a bool — e.g.
+    ``models_with("deepseek", tool_call=True)``. An unknown filter name or a
+    non-bool value raises ``TypeError``; the result is always sorted.
+    """
+    unknown = sorted(set(filters) - set(CAPABILITY_FILTERS))
+    if unknown:
+        raise TypeError(
+            f"unknown capability filter(s) {', '.join(unknown)}; "
+            f"expected {', '.join(CAPABILITY_FILTERS)}"
+        )
+    for name, value in filters.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"capability filter `{name}` must be a bool")
+    return _core.models_with(provider, filters or None)
+
+
 @dataclass(frozen=True)
 class Warning:
     """One of the Gate's advisory answers about a request.
@@ -163,7 +285,7 @@ class Client:
         *,
         base_url: str | None = None,
         options: OptionsLike | None = None,
-        capability_overrides: dict[str, Any] | None = None,
+        capability_overrides: CapabilityOverrides | None = None,
         timeout: float | None = None,
         auth: Auth | None = None,
         dashscope_region: DashScopeRegion | None = None,
@@ -193,13 +315,23 @@ class Client:
         retry_kwarg = (
             (retry.max_attempts > 1, retry.max_attempts) if retry else None
         )
+        if capability_overrides is not None and not isinstance(
+            capability_overrides, CapabilityOverrides
+        ):
+            raise TypeError(
+                "capability_overrides must be a CapabilityOverrides instance — "
+                "the dict form is gone, and unknown keys cannot be spelled on "
+                "the typed object"
+            )
         self._core = _core.Client(
             provider,
             model,
             api_key,
             base_url=base_url,
             options=options,
-            capability_overrides=capability_overrides,
+            capability_overrides=(
+                capability_overrides._to_core() if capability_overrides else None
+            ),
             timeout=timeout,
             auth=auth_kwarg,
             dashscope_region=region_kwarg,

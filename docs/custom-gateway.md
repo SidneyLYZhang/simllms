@@ -34,8 +34,8 @@ let client = Client::new(Provider::Custom, "my-gateway-model", "sk-...")
 网关上的模型 id 不会出现在 simllms 目录里，所以它们是 warn-and-pass：
 请求照发（两种语言都能先用 `warnings()` 预览那条警告）。要让门认真把关，两条路：
 
-1. **声明覆盖**：`capability_overrides={"image_input": False, ...}`——
-   之后违规请求在本地被拒。
+1. **声明覆盖**：`capability_overrides=CapabilityOverrides(image_input=False, ...)`
+   （Python，类型化对象）——之后违规请求在本地被拒。
 2. **提供商列表**：`Custom` 没有机读列表约定，`refresh_models()`（两种
    语言都有）会明确报错（绝不猜测）；目录 + 覆盖是仅有的两个能力来源。
 

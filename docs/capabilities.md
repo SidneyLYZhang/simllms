@@ -25,8 +25,9 @@ status                Active / Deprecated
    DeepSeek / Moonshot / DashScope / OpenRouter 的模型列表并按字段合并
    （列表确认存在、明说的字段覆盖目录、没说的继承目录）。Zhipu / MiMo
    没有机读列表，仅目录 + 用户覆盖。
-3. **用户声明（User）**：`capability_overrides` 覆盖任意字段，你比目录
-   更了解自己的网关时使用；覆盖后的记录报告 `Source::User`。
+3. **用户声明（User）**：`CapabilityOverrides`（Python）/ `CapabilityOverrides`
+   （Rust）覆盖任意字段，你比目录更了解自己的网关时使用；覆盖后的记录
+   报告 `Source::User` / `Source.USER`。
 
 ## 未知模型：warn-and-pass
 
@@ -49,10 +50,18 @@ OpenRouter 可用——其余提供商没有机器可读的模型列表，会得
 
 ## 覆盖示例
 
+Python 侧覆盖是类型化对象：拼错的键或错的值类型是 mypy 错误，运行时不
+会再遇到 `TypeError`。目录也开放为模块级查询（只读，不发请求）：
+
 ```python
+from simllms import CapabilityOverrides, capabilities, models_with
+
 client = Client("deepseek", "gateway-model", api_key,
-                capability_overrides={"image_input": True,
-                                      "context_window": 131072})
+                capability_overrides=CapabilityOverrides(
+                    image_input=True, context_window=131072))
+
+capabilities("deepseek", "deepseek-v4-pro")   # Capabilities 或 None（未知模型）
+models_with("deepseek", tool_call=True)       # 排序后的模型 id 列表
 ```
 
 ```rust

@@ -78,4 +78,5 @@ jobs:
         working-directory: crates/simllms-python
         run: |
           uv run --no-sync mypy python/simllms tests/test_client.py \
+            tests/test_capabilities.py tests/test_typing_surface.py \
             tests/test_package_inventory.py tests/test_release_artifacts.py

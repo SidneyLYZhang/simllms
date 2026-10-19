@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::capabilities::{Capabilities, CapabilityOverrides, ResolvedCapabilities, Source};
@@ -45,8 +45,7 @@ const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn default_catalog() -> &'static Catalog {
-    static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(Catalog::builtin)
+    crate::catalog::shared()
 }
 
 /// How the api key travels. `Bearer` is the OpenAI-compatible default;

@@ -9,6 +9,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Catalog is queryable from Python.** Module-level
+  `capabilities(provider, model)` answers `None` for an unknown Model Id
+  (the warn-and-pass answer is a query result, not an exception) and
+  `models_with(provider, **filters)` returns sorted ids over the enumerated
+  filter kwargs (`tool_call`, `structured_output`, `image_generation`,
+  `supports_image_input`, `reasoning`). `Capabilities` is exported as a
+  frozen dataclass and `Source` as a typed enum, so query results are
+  statically inspectable.
 - **The eight configuration and introspection entry points that were Rust-only
   are now bound in Python too.** The constructor takes `auth` (`Auth.bearer()` /
   `Auth.header(name, value)`), `dashscope_region`
@@ -101,6 +109,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   capability error without a network call, and the request debugger renders an
   outbound body with no credential in it. The release path fails the run if any
   of those checks skipped.
+
+### Removed
+
+- The `capability_overrides` dict parameter is gone: the constructor takes
+  only a typed `CapabilityOverrides` (or `None`), so a misspelled key or a
+  wrong value type is a mypy error instead of a runtime `TypeError`, and an
+  instance with no fields set overrides nothing. Unknown keys can no longer
+  be spelled.
 
 ### Changed
 

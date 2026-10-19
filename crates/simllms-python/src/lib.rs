@@ -12,7 +12,7 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 
-use simllms::capabilities::CapabilityOverrides;
+use simllms::capabilities::{CapabilityOverrides, Modality, ModelStatus, ReasoningMode};
 use simllms::error::{Error, MissingCapability};
 use simllms::message::{ContentBlock, ImageSource, Message, Role};
 use simllms::options::Options;
@@ -798,6 +798,135 @@ impl Client {
     }
 }
 
+/// The catalog's answer for a (provider, model) pair, as the pure-Python
+/// layer rebuilds its `Capabilities` dataclass from. `reasoning` is
+/// "none", "toggle", or "effort" (with the accepted levels beside it).
+#[pyclass]
+struct PyCapabilities {
+    #[pyo3(get)]
+    source: String,
+    #[pyo3(get)]
+    input_modalities: Vec<String>,
+    #[pyo3(get)]
+    structured_output: bool,
+    #[pyo3(get)]
+    tool_call: bool,
+    #[pyo3(get)]
+    image_generation: bool,
+    #[pyo3(get)]
+    reasoning: String,
+    #[pyo3(get)]
+    reasoning_levels: Vec<String>,
+    #[pyo3(get)]
+    context_window: Option<u64>,
+    #[pyo3(get)]
+    max_output_tokens: Option<u64>,
+    #[pyo3(get)]
+    status: String,
+}
+
+impl From<simllms::capabilities::Capabilities> for PyCapabilities {
+    fn from(caps: simllms::capabilities::Capabilities) -> Self {
+        use simllms::capabilities::Source;
+        let (reasoning, reasoning_levels) = match &caps.reasoning {
+            ReasoningMode::None => ("none".to_string(), Vec::new()),
+            ReasoningMode::Toggle => ("toggle".to_string(), Vec::new()),
+            ReasoningMode::Effort { levels } => (
+                "effort".to_string(),
+                levels.iter().cloned().collect::<Vec<String>>(),
+            ),
+        };
+        PyCapabilities {
+            source: match caps.source {
+                Source::Catalog => "catalog",
+                Source::Provider => "provider",
+                Source::User => "user",
+            }
+            .to_string(),
+            input_modalities: caps
+                .input_modalities
+                .iter()
+                .map(|m| match m {
+                    Modality::Text => "text",
+                    Modality::Image => "image",
+                    _ => unreachable!("a new `simllms::Modality` variant must be mapped here"),
+                })
+                .map(str::to_string)
+                .collect(),
+            structured_output: caps.structured_output,
+            tool_call: caps.tool_call,
+            image_generation: caps.image_generation,
+            reasoning,
+            reasoning_levels,
+            context_window: caps.context_window,
+            max_output_tokens: caps.max_output_tokens,
+            status: match caps.status {
+                ModelStatus::Active => "active",
+                ModelStatus::Deprecated => "deprecated",
+            }
+            .to_string(),
+        }
+    }
+}
+
+const CAPABILITY_FILTERS: &[&str] = &[
+    "tool_call",
+    "structured_output",
+    "image_generation",
+    "supports_image_input",
+    "reasoning",
+];
+
+/// What the vendored catalog says about one model — `None` for a Model Id
+/// it does not know (the warn-and-pass answer is a query result, ADR-0005).
+#[pyfunction]
+fn capabilities(provider: &str, model: &str) -> PyResult<Option<PyCapabilities>> {
+    let provider = parse_provider(provider)?;
+    Ok(match simllms::catalog::shared().resolve(provider, model) {
+        simllms::capabilities::ResolvedCapabilities::Known(caps) => {
+            Some(PyCapabilities::from(caps))
+        }
+        simllms::capabilities::ResolvedCapabilities::Unknown => None,
+    })
+}
+
+/// Ids of the provider's catalog models matching every filter, sorted.
+/// `filters` is a dict of bool values keyed by the known predicates
+/// (`CAPABILITY_FILTERS`); no filters means every cataloged id.
+#[pyfunction(signature = (provider, filters=None))]
+fn models_with(provider: &str, filters: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
+    let provider = parse_provider(provider)?;
+    let mut wanted: Vec<(String, bool)> = Vec::new();
+    if let Some(dict) = filters {
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            if !CAPABILITY_FILTERS.contains(&key.as_str()) {
+                return Err(PyTypeError::new_err(format!(
+                    "unknown capability filter `{key}`; expected {}",
+                    CAPABILITY_FILTERS.join(", ")
+                )));
+            }
+            let value: bool = v.extract().map_err(|_| {
+                PyTypeError::new_err(format!("capability filter `{key}` must be a bool"))
+            })?;
+            wanted.push((key, value));
+        }
+    }
+    Ok(simllms::catalog::shared().models_with(provider, |caps| {
+        wanted.iter().all(|(name, want)| {
+            let actual = match name.as_str() {
+                "tool_call" => caps.tool_call,
+                "structured_output" => caps.structured_output,
+                "image_generation" => caps.image_generation,
+                "supports_image_input" => caps.accepts_image_input(),
+                "reasoning" => !matches!(caps.reasoning, ReasoningMode::None),
+                _ => unreachable!("a new `CAPABILITY_FILTERS` entry must be matched here"),
+            };
+            actual == *want
+        })
+    }))
+}
+
 #[pymodule(name = "_core")]
 fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -812,5 +941,8 @@ fn simllms_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChatStream>()?;
     m.add("GeneratedImage", m.py().get_type::<PyGeneratedImage>())?;
     m.add("Warning", m.py().get_type::<PyWarning>())?;
+    m.add("Capabilities", m.py().get_type::<PyCapabilities>())?;
+    m.add_function(wrap_pyfunction!(capabilities, m)?)?;
+    m.add_function(wrap_pyfunction!(models_with, m)?)?;
     Ok(())
 }
