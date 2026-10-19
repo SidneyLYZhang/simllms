@@ -14,7 +14,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from simllms import _core
 from simllms._core import (
@@ -26,7 +26,6 @@ from simllms._core import (
     Reply,
     SimLLMError,
     TransportError,
-    Warning,
 )
 
 __all__ = [
@@ -65,6 +64,8 @@ seed, presence_penalty, frequency_penalty, reasoning_enabled, reasoning_effort,
 response_schema. Provider-specific extras go under `extra`."""
 
 _DONE = object()
+
+WarningKind = Literal["unknown_model", "deprecated_model"]
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,21 @@ class RetryPolicy:
     @staticmethod
     def disabled() -> RetryPolicy:
         return RetryPolicy(max_attempts=1)
+
+
+@dataclass(frozen=True)
+class Warning:
+    """One of the Gate's advisory answers about a request.
+
+    ``kind`` is ``"unknown_model"`` when the Model Id is not in the catalog
+    (``provider`` names which catalog it was missed in) or
+    ``"deprecated_model"`` when it is retired. Both pass through at call
+    time — a warning is advice, never a refusal.
+    """
+
+    kind: WarningKind
+    provider: str | None
+    model: str
 
 
 class Client:
@@ -234,11 +250,18 @@ class Client:
         options: OptionsLike | None = None,
     ) -> list[Warning]:
         """The Gate's structured warnings for this request, answered from the
-        catalog alone: an unknown Model Id (:data:`Warning.kind` is
+        catalog alone: an unknown Model Id (:attr:`Warning.kind` is
         ``"unknown_model"``) and a deprecated one (``"deprecated_model"``)
         pass through at call time — this makes them visible before you pay.
+
+        The _core pyclass carries ``kind`` as a plain str because it crosses
+        the extension boundary; only the two kinds below ever exist (the
+        Rust mapping refuses any other), hence the cast.
         """
-        return self._core.warnings(messages, options)
+        return [
+            Warning(kind=cast(WarningKind, core.kind), provider=core.provider, model=core.model)
+            for core in self._core.warnings(messages, options)
+        ]
 
     def refresh_models(self) -> list[str]:
         """Consult the provider's own model listing (blocking). Only

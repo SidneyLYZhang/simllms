@@ -81,9 +81,9 @@ missing capability ImageInput; capable models on this provider: deepseek-v4-flas
    `Client(..., capability_overrides={"image_input": True})`（Python）/
    `with_capability_overrides`（Rust）。
 2. **未知模型**：不在目录里的模型 id（比如网关上的新模型）是
-   warn-and-pass（ADR-0005）——请求照发；Rust 侧还能先用 `warnings()`
-   预览那条警告。
-3. **让提供商自己说**：`refresh_models()`（本版仅 Rust）拉取提供商
+   warn-and-pass（ADR-0005）——请求照发；还能先用 `warnings()`（两种
+   语言都有）预览那条警告。
+3. **让提供商自己说**：`refresh_models()`（两种语言都有）拉取提供商
    的模型列表并按优先级合并，之后模型从“未知”变成 Known。
 
 详见 [capabilities.md](capabilities.md)。

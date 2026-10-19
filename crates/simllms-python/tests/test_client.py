@@ -633,6 +633,10 @@ def test_default_headers_ride_on_the_request(gateway: MockGateway) -> None:
 
 
 def test_explicit_base_url_wins_over_the_region_host(gateway: MockGateway) -> None:
+    # Host selection itself (cn/singapore/workspace/zhipu international) is
+    # proven in the Rust core's own tests; hermetically, the binding proves
+    # the region kwarg is applied by exercising the precedence an explicit
+    # base_url keeps over it.
     client = Client(
         "dashscope",
         "test-model",
@@ -660,16 +664,21 @@ def test_explicit_base_url_wins_over_zhipu_international(
     assert reply.content == "hello from the mock"
 
 
-def test_region_auth_retry_and_header_kwargs_translate_to_core(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, Any] = {}
+def _capturing_core(captured: dict[str, Any]) -> type:
+    """A stand-in for `_core.Client` that records the pure-Python layer's kwargs."""
 
     class FakeCore:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             captured.update(kwargs)
 
-    monkeypatch.setattr(simllms._core, "Client", FakeCore)
+    return FakeCore
+
+
+def test_region_auth_retry_and_header_kwargs_translate_to_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(simllms._core, "Client", _capturing_core(captured))
     simllms.Client(
         "dashscope",
         "test-model",
@@ -693,12 +702,7 @@ def test_bearer_and_region_factories_translate_to_core(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
-
-    class FakeCore:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(simllms._core, "Client", FakeCore)
+    monkeypatch.setattr(simllms._core, "Client", _capturing_core(captured))
     simllms.Client(
         "dashscope",
         "test-model",
@@ -717,7 +721,7 @@ def test_retry_policy_retries_then_succeeds(gateway: MockGateway) -> None:
     def flaky(handler: MockHandler) -> None:
         state["count"] += 1
         if state["count"] <= 2:
-            handler._respond(500, {"error": {"message": "upstream hiccup"}})
+            handler._respond(500, {"error": {"message": "provider hiccup"}})
         else:
             handler._respond(200, SUCCESS_BODY)
 
@@ -738,7 +742,7 @@ def test_retry_policy_retries_then_succeeds(gateway: MockGateway) -> None:
 
 def test_retry_disabled_fails_on_the_first_attempt(gateway: MockGateway) -> None:
     def broken(handler: MockHandler) -> None:
-        handler._respond(500, {"error": {"message": "upstream hiccup"}})
+        handler._respond(500, {"error": {"message": "provider hiccup"}})
 
     gateway.route("/v1/broken", broken)
     client = Client(
@@ -802,11 +806,13 @@ def test_stream_timeouts_leave_a_healthy_stream_alone(gateway: MockGateway) -> N
         api_key="sk-test",
         base_url=gateway.base_url + "/stream",
         stream_timeouts=(5.0, 5.0),
+        default_headers={"X-Tenant": "acme"},
     )
 
     chunks = list(client.chat_stream(["hi"]))
 
     assert [c.text for c in chunks if c.text is not None] == ["Hel", "lo"]
+    assert gateway.headers_log[-1]["x-tenant"] == "acme"
 
 
 def test_warnings_reports_an_unknown_model() -> None:

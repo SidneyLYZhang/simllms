@@ -80,6 +80,8 @@ fn parse_provider(name: &str) -> PyResult<Provider> {
     }
 }
 
+const AUTH_SHAPES: &str = "`(\"bearer\",)` or a `(\"header\", name, value)` triple";
+
 /// `("bearer",)` or a `(name, value)` pair, as the pure-Python layer sends
 /// it. `None` keeps the provider default (Bearer, except MiMo's `api-key:`).
 fn apply_auth(client: simllms::Client, auth: &Bound<'_, PyAny>) -> PyResult<simllms::Client> {
@@ -88,7 +90,7 @@ fn apply_auth(client: simllms::Client, auth: &Bound<'_, PyAny>) -> PyResult<siml
             return Ok(client.with_auth(simllms::Auth::Header { name, value }));
         }
         return Err(PyTypeError::new_err(format!(
-            "unknown auth shape `{kind}`; expected `(\"bearer\",)` or a `(\"header\", name, value)` triple"
+            "unknown auth shape `{kind}`; expected {AUTH_SHAPES}"
         )));
     }
     if let Ok((kind,)) = auth.extract::<(String,)>() {
@@ -96,13 +98,22 @@ fn apply_auth(client: simllms::Client, auth: &Bound<'_, PyAny>) -> PyResult<siml
             return Ok(client.with_auth(simllms::Auth::Bearer));
         }
         return Err(PyTypeError::new_err(format!(
-            "unknown auth shape `{kind}`; expected `(\"bearer\",)` or a `(header, name, value)` triple"
+            "unknown auth shape `{kind}`; expected {AUTH_SHAPES}"
         )));
     }
-    Err(PyTypeError::new_err(
-        "auth must be `(\"bearer\",)` or a `(header, name, value)` triple",
-    ))
+    Err(PyTypeError::new_err(format!("auth must be {AUTH_SHAPES}")))
 }
+
+const DASHSCOPE_REGION_SHAPES: &str =
+    "\"cn\", \"singapore\", or a (\"workspace\", id, region) triple";
+const KNOWN_WORKSPACE_REGIONS: &[&str] = &[
+    DASHSCOPE_CN_BEIJING,
+    DASHSCOPE_AP_SOUTHEAST_1,
+    DASHSCOPE_CN_HONGKONG,
+    DASHSCOPE_EU_CENTRAL_1,
+    DASHSCOPE_AP_NORTHEAST_1,
+    DASHSCOPE_US_EAST_1,
+];
 
 /// `"cn"`, `"singapore"`, or a `("workspace", id, region)` triple. The region
 /// must be one DashScope documents for workspaces — anything else is a typo,
@@ -117,7 +128,7 @@ fn apply_dashscope_region(
             "singapore" => DashScopeRegion::Singapore,
             other => {
                 return Err(PyTypeError::new_err(format!(
-                    "unknown DashScope region `{other}`; expected \"cn\", \"singapore\", or a (\"workspace\", id, region) triple"
+                    "unknown DashScope region `{other}`; expected {DASHSCOPE_REGION_SHAPES}"
                 )));
             }
         };
@@ -126,27 +137,29 @@ fn apply_dashscope_region(
     if let Ok((kind, id, workspace_region)) = region.extract::<(String, String, String)>() {
         if kind != "workspace" {
             return Err(PyTypeError::new_err(format!(
-                "unknown DashScope region shape `{kind}`; expected \"cn\", \"singapore\", or a (\"workspace\", id, region) triple"
+                "unknown DashScope region shape `{kind}`; expected {DASHSCOPE_REGION_SHAPES}"
             )));
         }
-        let known = match workspace_region.as_str() {
-            DASHSCOPE_CN_BEIJING => DASHSCOPE_CN_BEIJING,
-            DASHSCOPE_AP_SOUTHEAST_1 => DASHSCOPE_AP_SOUTHEAST_1,
-            DASHSCOPE_CN_HONGKONG => DASHSCOPE_CN_HONGKONG,
-            DASHSCOPE_EU_CENTRAL_1 => DASHSCOPE_EU_CENTRAL_1,
-            DASHSCOPE_AP_NORTHEAST_1 => DASHSCOPE_AP_NORTHEAST_1,
-            DASHSCOPE_US_EAST_1 => DASHSCOPE_US_EAST_1,
-            other => {
+        let known = KNOWN_WORKSPACE_REGIONS
+            .iter()
+            .find(|r| **r == workspace_region);
+        match known {
+            Some(known) => {
+                return Ok(
+                    client.with_dashscope_region(DashScopeRegion::Workspace { id, region: known })
+                );
+            }
+            None => {
                 return Err(PyTypeError::new_err(format!(
-                    "unknown DashScope workspace region `{other}`; expected cn-beijing, ap-southeast-1, cn-hongkong, eu-central-1, ap-northeast-1, or us-east-1"
+                    "unknown DashScope workspace region `{workspace_region}`; expected {}",
+                    KNOWN_WORKSPACE_REGIONS.join(", ")
                 )));
             }
-        };
-        return Ok(client.with_dashscope_region(DashScopeRegion::Workspace { id, region: known }));
+        }
     }
-    Err(PyTypeError::new_err(
-        "dashscope_region must be \"cn\", \"singapore\", or a (\"workspace\", id, region) triple",
-    ))
+    Err(PyTypeError::new_err(format!(
+        "dashscope_region must be {DASHSCOPE_REGION_SHAPES}"
+    )))
 }
 
 fn map_error(err: Error) -> PyErr {

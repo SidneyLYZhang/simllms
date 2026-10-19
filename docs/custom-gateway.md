@@ -32,7 +32,7 @@ let client = Client::new(Provider::Custom, "my-gateway-model", "sk-...")
 ## 网关模型与能力门（ADR-0005）
 
 网关上的模型 id 不会出现在 simllms 目录里，所以它们是 warn-and-pass：
-请求照发（Rust 侧还能先预览那条警告）。要让门认真把关，两条路：
+请求照发（两种语言都能先用 `warnings()` 预览那条警告）。要让门认真把关，两条路：
 
 1. **声明覆盖**：`capability_overrides={"image_input": False, ...}`——
    之后违规请求在本地被拒。
