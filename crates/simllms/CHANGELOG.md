@@ -55,8 +55,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   per platform, build and publish as separate jobs joined by artifacts, and every
   gate the pull-request path runs. It also requires the release file to *run* the
   verdicts that decide a release — `check-release` and `check-artifacts` — and to
-  hand the seam its tag and its wheel, because a deleted step leaves a file that
-  is still well-formed and a rule nobody invokes stops nothing.
+  hand the seam its tag, the wheel it installs, and the name of the environment it
+  installs into, because a deleted step leaves a file that is still well-formed and
+  a rule nobody invokes stops nothing.
   `cargo xtask check-artifacts <dir> --tag <tag>` compares a built artifact set
   against the intended platforms, so a missing platform and an unexpected extra
   both go red.

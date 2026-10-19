@@ -232,15 +232,46 @@ pub fn check_invoked_gates(text: &str) -> Vec<String> {
             format!("`{RELEASE_WORKFLOW}` never assigns `SIMLLMS_RELEASE_TAG`, so the seam suite has no tag to compare the artifacts against — every release assertion in it skips, and the run reports green having tested nothing."),
         );
     }
-    let installs_a_named_artifact = run
-        .lines()
-        .any(|line| line.contains("pip install") && line.contains("SIMLLMS_WHEEL"));
-    if !installs_a_named_artifact {
+    if !mapping_keys(text, &["jobs"])
+        .iter()
+        .any(|job| installs_the_wheel(text, job))
+    {
         problems.push(format!(
             "`{RELEASE_WORKFLOW}` installs no `$SIMLLMS_WHEEL`, so the seam suite imports this checkout rather than the artifact a Registry would hand out — name the wheel it downloads and install that."
         ));
     }
     problems
+}
+
+/// The wheel is put into an interpreter by one job, and that job has to name the
+/// interpreter. `setup-uv` activates a `.venv` at the workspace root as soon as it
+/// is given a `python-version`, while `uv run` follows the *project* environment
+/// and prints that it is ignoring the active one — so an unnamed environment is
+/// decided by a `PATH` search, and the seam suite runs wherever a `pytest` happens
+/// to live rather than in the venv built for the artifact.
+pub fn check_seam_environment(text: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for job in mapping_keys(text, &["jobs"]) {
+        if !installs_the_wheel(text, &job) {
+            continue;
+        }
+        if !code(&job_body(text, &job)).contains("UV_PROJECT_ENVIRONMENT") {
+            problems.push(format!(
+                "the job `{job}` installs the wheel into a venv it never names: `uv pip` follows `VIRTUAL_ENV` and `uv run` follows the project environment, and those are two directories here. Point `UV_PROJECT_ENVIRONMENT` at the `.venv` this job creates, so the artifact is tested in the environment that holds it."
+            ));
+        }
+    }
+    problems
+}
+
+/// The job that installs the released wheel, as opposed to any job that installs
+/// something. One job owns the seam, so a rule about the seam is scoped here and
+/// not to the whole file — otherwise an install in one job and a setting in
+/// another would satisfy it together while neither job had both.
+fn installs_the_wheel(text: &str, job: &str) -> bool {
+    code(&job_body(text, job))
+        .lines()
+        .any(|line| line.contains("pip install") && line.contains("SIMLLMS_WHEEL"))
 }
 
 /// What the workflow is allowed to be triggered by: a version tag, and a hand
@@ -845,6 +876,7 @@ jobs:
       SIMLLMS_SDIST: ${{ needs.inventory.outputs.sdist }}
       SIMLLMS_WHEEL: ${{ needs.inventory.outputs.wheel }}
       SIMLLMS_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -1419,6 +1451,33 @@ jobs:
             problems.iter().any(|p| p.contains("SIMLLMS_WHEEL")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn the_seam_names_the_environment_the_wheel_goes_into() {
+        assert!(
+            check_seam_environment(RELEASE).is_empty(),
+            "{:?}",
+            check_seam_environment(RELEASE)
+        );
+
+        let unnamed = RELEASE.replace(
+            "      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv\n",
+            "",
+        );
+        let problems = check_seam_environment(&unnamed);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("seam"), "{}", problems[0]);
+
+        // Naming it in some other job is not naming it in the one that installs:
+        // two jobs can satisfy a file-wide scan while neither has both halves.
+        let named_elsewhere = unnamed.replace(
+            "  inventory:\n    needs: [verify, wheels, distributions]\n",
+            "  inventory:\n    env:\n      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv\n    needs: [verify, wheels, distributions]\n",
+        );
+        let problems = check_seam_environment(&named_elsewhere);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("seam"), "{}", problems[0]);
     }
 
     #[test]

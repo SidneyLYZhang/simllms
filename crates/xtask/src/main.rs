@@ -179,6 +179,7 @@ fn check_workflow() {
             problems.extend(release::check_separation(&text));
             problems.extend(release::check_gate_parity(&ci, &text));
             problems.extend(release::check_invoked_gates(&text));
+            problems.extend(release::check_seam_environment(&text));
             problems
         }
     };

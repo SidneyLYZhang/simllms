@@ -173,10 +173,10 @@ jobs:
         run: cargo package --allow-dirty -p simllms
       - name: Build the sdist
         working-directory: crates/simllms-python
-        # Through the build backend the project declares, in an environment uv
-        # builds outside the checkout. A `uv venv` here would land on the `.venv`
-        # this job just planted, and the plant is the proof that an ignored
-        # directory cannot reach an archive — so it stays, and the venv goes.
+        # Through the build backend the project declares, in an environment this
+        # job does not make: `setup-uv` has already put a `.venv` at the workspace
+        # root, and the one planted below is the ignored-directory proof. A `uv
+        # venv` here would collide with a directory that is evidence.
         run: uv build --sdist --out-dir dist
       - name: Upload the crate
         # Two artifacts, not one: `upload-artifact` stores paths relative to the
@@ -217,6 +217,13 @@ jobs:
     name: The artifacts, in an environment that has never seen the source tree
     needs: [verify, inventory]
     runs-on: ubuntu-latest
+    env:
+      # `uv pip` follows `VIRTUAL_ENV` and `uv run` follows the project
+      # environment, and `setup-uv` puts a `.venv` of its own at the workspace
+      # root the moment it is given a `python-version`. Left unnamed, the two
+      # diverge and the tests run against whichever `pytest` a `PATH` search
+      # finds — so the clean environment this job claims is one it names.
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -236,9 +243,10 @@ jobs:
       - name: Install the wheel, and nothing else
         # The test tools beside it, and no editable install: an import that
         # resolved into `python/simllms` would be a test of this checkout called
-        # a test of the release.
+        # a test of the release. `--clear` because the venv this job tests in is
+        # one it builds, not one it inherited from the action above.
         run: |
-          uv venv
+          uv venv --clear
           uv pip install "$SIMLLMS_WHEEL" pytest mypy
       - name: The seam suite against the built artifacts
         env:
