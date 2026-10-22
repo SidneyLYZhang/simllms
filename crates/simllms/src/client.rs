@@ -1147,6 +1147,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_delivers_the_text_packed_into_the_reasoning_event() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "text/event-stream")
+            .with_body(
+                "data: {\"choices\":[{\"index\":4,\"delta\":{\"reasoning_content\":\"thinking\",\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\ndata: [DONE]\n\n",
+            )
+            .create_async()
+            .await;
+
+        let client = Client::new(Provider::DeepSeek, "deepseek-v4-pro", "sk-test")
+            .with_base_url(server.url());
+        let mut stream = client
+            .chat_stream(vec![Message::text("hello")])
+            .await
+            .expect("stream must start");
+
+        let mut steps = Vec::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may fail");
+            steps.push((
+                chunk.index,
+                chunk.delta,
+                chunk.finish_reason,
+                chunk.usage.map(|u| u.total_tokens),
+            ));
+        }
+        mock.assert_async().await;
+
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    4,
+                    Some(crate::stream::Delta::Reasoning {
+                        text: "thinking".into()
+                    }),
+                    None,
+                    None,
+                ),
+                (
+                    4,
+                    Some(crate::stream::Delta::Text {
+                        text: "answer".into()
+                    }),
+                    Some("stop".into()),
+                    Some(Some(3)),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn mid_stream_provider_error_surfaces_as_api_after_partial_content() {
         let mut server = Server::new_async().await;
         let body = format!(

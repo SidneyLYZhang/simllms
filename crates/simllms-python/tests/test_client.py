@@ -355,6 +355,44 @@ def test_sync_stream_yields_normalized_chunks(gateway: MockGateway) -> None:
     assert body["stream_options"] == {"include_usage": True}
 
 
+MIXED_SSE_BODY = (
+    'data: {"choices":[{"index":7,"delta":{"reasoning_content":"thinking","content":"answer"},'
+    '"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+def test_stream_splits_one_event_carrying_both_into_two_objects(gateway: MockGateway) -> None:
+    """A Chunk already flattens a step into independent optional text and
+    reasoning fields, so an event carrying both halves arrives as two objects
+    and the Python surface needs no change."""
+
+    def sse(handler: MockHandler) -> None:
+        payload = MIXED_SSE_BODY.encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    gateway.route("/v1/stream", sse)
+    client = Client(
+        "openrouter",
+        "test-model",
+        api_key="sk-test",
+        base_url=gateway.base_url + "/stream",
+    )
+
+    chunks = list(client.chat_stream(["hi"]))
+
+    assert [(c.reasoning, c.text) for c in chunks] == [("thinking", None), (None, "answer")]
+    assert [c.index for c in chunks] == [7, 7]
+    assert chunks[0].finish_reason is None
+    assert chunks[0].total_tokens is None
+    assert chunks[-1].finish_reason == "stop"
+    assert chunks[-1].total_tokens == 6
+
+
 def test_async_stream_yields_normalized_chunks(gateway: MockGateway) -> None:
     def sse_slow(handler: MockHandler) -> None:
         head, rest = SSE_BODY.split("\n\n", 1)  # first event, then the rest

@@ -80,10 +80,17 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Normalizes one `data:` payload into a Chunk. A provider error event
-/// surfaces as `Api` with status 0 (no HTTP status exists mid-stream);
-/// the raw event JSON is preserved as evidence.
-fn parse_chunk(data: &str) -> Result<Chunk, Error> {
+/// Normalizes one `data:` payload into the steps it carries. A provider may
+/// pack reasoning and text into the same event, so one event yields a
+/// sequence: reasoning first, then text — our fixed order, not the field
+/// order on the wire, so a UI can keep its thinking pane collapsed while the
+/// answer begins. A field the provider left empty carries nothing and is not
+/// a step: reasoning models send `content: ""` on every reasoning event, and
+/// those must not arrive as an empty answer. The event's finish reason and
+/// Usage ride the last step, and every step of one event carries the same
+/// choice index. A provider error event surfaces as `Api` with status 0 (no
+/// HTTP status exists mid-stream); the raw event JSON is preserved as evidence.
+fn parse_event(data: &str) -> Result<Vec<Chunk>, Error> {
     let v: serde_json::Value = serde_json::from_str(data).map_err(|e| {
         Error::Api(ApiError {
             status: 0,
@@ -106,24 +113,27 @@ fn parse_chunk(data: &str) -> Result<Chunk, Error> {
 
     let choice = v.pointer("/choices/0");
     let delta = choice.and_then(|c| c.get("delta"));
-    let chunk_delta = delta.and_then(|d| {
-        let text = d.get("content").and_then(|t| t.as_str());
-        let reasoning = d
-            .get("reasoning_content")
-            .or_else(|| d.get("reasoning"))
-            .and_then(|t| t.as_str());
-        if let Some(r) = reasoning {
-            Some(Delta::Reasoning {
-                text: r.to_string(),
-            })
-        } else if let Some(t) = text {
-            Some(Delta::Text {
-                text: t.to_string(),
-            })
-        } else {
-            None
-        }
-    });
+    let text = delta
+        .and_then(|d| d.get("content"))
+        .and_then(|t| t.as_str());
+    let reasoning = delta
+        .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+        .and_then(|t| t.as_str());
+
+    let mut steps: Vec<Option<Delta>> = Vec::new();
+    if let Some(step) = reasoning.filter(|value| !value.is_empty()) {
+        steps.push(Some(Delta::Reasoning {
+            text: step.to_string(),
+        }));
+    }
+    if let Some(step) = text.filter(|value| !value.is_empty()) {
+        steps.push(Some(Delta::Text {
+            text: step.to_string(),
+        }));
+    }
+    if steps.is_empty() {
+        steps.push(None);
+    }
 
     let usage = v.get("usage").filter(|u| u.is_object()).and_then(|u| {
         Some(Usage {
@@ -132,19 +142,30 @@ fn parse_chunk(data: &str) -> Result<Chunk, Error> {
             total_tokens: u.get("total_tokens").and_then(|x| x.as_u64()),
         })
     });
+    let finish_reason = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+        .map(str::to_string);
+    let index = choice
+        .and_then(|c| c.get("index"))
+        .and_then(|i| i.as_u64())
+        .unwrap_or(0);
 
-    Ok(Chunk {
-        index: choice
-            .and_then(|c| c.get("index"))
-            .and_then(|i| i.as_u64())
-            .unwrap_or(0),
-        delta: chunk_delta,
-        finish_reason: choice
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|f| f.as_str())
-            .map(str::to_string),
-        usage,
-    })
+    let mut chunks: Vec<Chunk> = steps
+        .into_iter()
+        .map(|step| Chunk {
+            index,
+            delta: step,
+            finish_reason: None,
+            usage: None,
+        })
+        .collect();
+    if let Some(last) = chunks.last_mut() {
+        last.finish_reason = finish_reason;
+        last.usage = usage;
+    }
+
+    Ok(chunks)
 }
 
 /// The stream returned by `chat_stream`. Implements `futures_core::Stream`
@@ -156,6 +177,7 @@ fn parse_chunk(data: &str) -> Result<Chunk, Error> {
 pub struct ChatStream {
     byte_stream: Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
     buffer: Vec<u8>,
+    remainder: std::collections::VecDeque<Chunk>,
     created_at: Instant,
     first_token_timeout: Duration,
     idle_timeout: Duration,
@@ -175,6 +197,7 @@ impl ChatStream {
         ChatStream {
             byte_stream: Box::pin(response.bytes_stream()),
             buffer: Vec::new(),
+            remainder: std::collections::VecDeque::new(),
             created_at: Instant::now(),
             first_token_timeout,
             idle_timeout,
@@ -215,6 +238,13 @@ impl Stream for ChatStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            // Deliver the steps already made from this event before framing
+            // another one, and before `finished` is consulted: an event's
+            // remainder is owed to the caller even when the next frame is
+            // `[DONE]`, EOF or an error.
+            if let Some(chunk) = this.remainder.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
+            }
             if this.finished {
                 return Poll::Ready(None);
             }
@@ -227,8 +257,11 @@ impl Stream for ChatStream {
                         this.finished = true;
                         return Poll::Ready(None);
                     }
-                    SseEvent::Data(data) => match parse_chunk(&data) {
-                        Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                    SseEvent::Data(data) => match parse_event(&data) {
+                        Ok(chunks) => {
+                            this.remainder.extend(chunks);
+                            continue;
+                        }
                         Err(e) => {
                             this.finished = true;
                             return Poll::Ready(Some(Err(e)));
@@ -323,16 +356,28 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
+    /// An event that carries one field normalizes into exactly one step.
+    fn one_step(data: &str) -> Chunk {
+        let mut chunks = parse_event(data).expect("event must parse");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "a single-field event yields exactly one step"
+        );
+        chunks.remove(0)
+    }
+
     #[test]
     fn parses_text_reasoning_usage_and_finish() {
-        let text = parse_chunk("{\"choices\":[{\"index\":3,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}").unwrap();
+        let text = one_step(
+            "{\"choices\":[{\"index\":3,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}",
+        );
         assert_eq!(text.index, 3);
         assert_eq!(text.delta, Some(Delta::Text { text: "hi".into() }));
 
-        let reasoning = parse_chunk(
+        let reasoning = one_step(
             "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}],\"usage\":null}",
-        )
-        .unwrap();
+        );
         assert_eq!(
             reasoning.delta,
             Some(Delta::Reasoning {
@@ -340,17 +385,108 @@ mod tests {
             })
         );
 
-        let final_chunk = parse_chunk(
+        let final_chunk = one_step(
             "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9,\"total_tokens\":16}}",
-        )
-        .unwrap();
+        );
         assert_eq!(final_chunk.finish_reason.as_deref(), Some("stop"));
         assert_eq!(final_chunk.usage.map(|u| u.total_tokens), Some(Some(16)));
     }
 
     #[test]
+    fn one_event_yields_one_step_per_field_it_carries() {
+        let cases: Vec<(serde_json::Value, Vec<Option<Delta>>)> = vec![
+            (
+                serde_json::json!({ "reasoning_content": "reasoning" }),
+                vec![Some(Delta::Reasoning {
+                    text: "reasoning".into(),
+                })],
+            ),
+            (
+                serde_json::json!({ "content": "text" }),
+                vec![Some(Delta::Text {
+                    text: "text".into(),
+                })],
+            ),
+            (
+                serde_json::json!({ "reasoning_content": "reasoning", "content": "text" }),
+                vec![
+                    Some(Delta::Reasoning {
+                        text: "reasoning".into(),
+                    }),
+                    Some(Delta::Text {
+                        text: "text".into(),
+                    }),
+                ],
+            ),
+            // The shape reasoning models send while thinking: an empty answer
+            // field rides every reasoning event, and carries no step.
+            (
+                serde_json::json!({ "reasoning_content": "reasoning", "content": "" }),
+                vec![Some(Delta::Reasoning {
+                    text: "reasoning".into(),
+                })],
+            ),
+            (
+                serde_json::json!({ "reasoning_content": "", "content": "text" }),
+                vec![Some(Delta::Text {
+                    text: "text".into(),
+                })],
+            ),
+            (
+                serde_json::json!({ "reasoning_content": "", "content": "" }),
+                vec![None],
+            ),
+            (serde_json::json!({ "role": "assistant" }), vec![None]),
+        ];
+        for (fields, expected) in cases {
+            let event = serde_json::to_string(&serde_json::json!({
+                "choices": [{ "index": 0, "delta": fields }]
+            }))
+            .expect("fixture is valid JSON");
+            let chunks = parse_event(&event).expect("event must parse");
+            assert_eq!(
+                chunks.iter().map(|c| c.delta.clone()).collect::<Vec<_>>(),
+                expected,
+                "for the event {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_with_reasoning_and_text_yields_both_steps() {
+        // Written with the answer field first on the wire: the step order is
+        // ours, never the provider's field order.
+        let chunks = parse_event(
+            "{\"choices\":[{\"index\":2,\"delta\":{\"reasoning_content\":\"thinking\",\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}",
+        )
+        .expect("an event carrying both is legal");
+        assert_eq!(
+            chunks.iter().map(|c| c.delta.clone()).collect::<Vec<_>>(),
+            vec![
+                Some(Delta::Reasoning {
+                    text: "thinking".into()
+                }),
+                Some(Delta::Text {
+                    text: "answer".into()
+                }),
+            ]
+        );
+        assert!(
+            chunks.iter().all(|c| c.index == 2),
+            "steps of one event share the choice index"
+        );
+        assert_eq!(chunks[0].finish_reason, None);
+        assert_eq!(chunks[1].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunks[0].usage, None);
+        assert_eq!(
+            chunks[1].usage.as_ref().and_then(|u| u.total_tokens),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn provider_error_event_maps_to_api() {
-        let err = parse_chunk("{\"error\":{\"message\":\"quota exceeded\"}}")
+        let err = parse_event("{\"error\":{\"message\":\"quota exceeded\"}}")
             .expect_err("error event must fail");
         match err {
             Error::Api(e) => {

@@ -135,6 +135,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   carries all twelve. `check-package` requires the crate's set to be a subset
   of the Python one.
 
+### Fixed
+
+- **A streaming event that carries reasoning and text in the same delta no
+  longer drops the text.** The reasoning branch matched first and the text
+  branch never ran, so the answer was read and then thrown away — no error, no
+  warning, nothing for the caller to notice. One event now normalizes into a
+  sequence of steps: `Reasoning` first, then `Text` — that fixed order, not the
+  provider's field order, so a UI can keep its thinking pane collapsed while the
+  answer begins. The event's finish reason and Usage ride the last step, so a
+  consumer's "the final chunk ends the stream" logic does not change, and every
+  step of one event carries the same choice index, so the two steps stay
+  recognizably one candidate answer. A field the provider left empty carries no
+  step: reasoning models send `content: ""` on every reasoning event, and that
+  is not an answer. The public `Delta` and `Chunk` shapes are untouched — the
+  interpretation step is private to the crate and the stream was already a
+  sequence — and the Python view needs no change either: a step was already
+  flattened into independent optional `text` and `reasoning` fields, so the
+  split arrives as two objects. This is patch-level.
+
 ## [0.1.0] - 2026-10-16
 
 First working release: one request shape, one response shape, and a
